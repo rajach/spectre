@@ -6,6 +6,7 @@
 """
 from typing import Optional, Sequence
 from .factor import BaseFactor, CustomFactor
+from ..parallel import nansum, nanmean
 from .engine import OHLCV
 import numpy as np
 import torch
@@ -36,7 +37,7 @@ class SimpleMovingAverage(CustomFactor):
     _min_win = 2
 
     def compute(self, data):
-        return data.mean()
+        return data.nanmean()
 
 
 class WeightedAverageValue(CustomFactor):
@@ -44,7 +45,7 @@ class WeightedAverageValue(CustomFactor):
 
     def compute(self, base, weight):
         def _weight_mean(_base, _weight):
-            return (_base * _weight).sum(dim=2) / _weight.sum(dim=2)
+            return nansum(_base * _weight, dim=2) / nansum(_weight, dim=2)
 
         return base.agg(_weight_mean, weight)
 
@@ -67,9 +68,6 @@ class ExponentialWeightedMovingAverage(CustomFactor):
         # Length required to achieve 99.97% accuracy, np.log(1-99.97/100) / np.log(alpha)
         # simplification to 4 * (span+1). 3.45 achieve 99.90%, 2.26 99.00%
         self.win = int(4.5 * (self.span + 1))
-        # For GPU efficiency here, weight is not float64 type, EMA 50+ will leading to inaccurate,
-        # and so window greater than 200 produces a very small and negligible weight
-        self.win = min(self.win, 200)
         self.weight = np.full(self.win, 1 - self.alpha) ** np.arange(self.win - 1, -1, -1)
         if self.adjust:
             self.weight = self.weight / sum(self.weight)  # to sum one
@@ -80,7 +78,7 @@ class ExponentialWeightedMovingAverage(CustomFactor):
             self.weight = torch.tensor(self.weight, dtype=torch.float32, device=engine.device)
 
     def compute(self, data):
-        weighted_mean = data.agg(lambda x: (x * self.weight).sum(dim=2))
+        weighted_mean = data.agg(lambda x: nansum(x * self.weight, dim=2))
         if self.adjust:
             return weighted_mean
         else:
@@ -97,7 +95,7 @@ class AverageDollarVolume(CustomFactor):
         if self.win == 1:
             return closes * volumes
         else:
-            return closes.agg(lambda c, v: (c * v).sum(dim=2) / self.win, volumes)
+            return closes.agg(lambda c, v: nanmean(c * v, dim=2), volumes)
 
 
 class AnnualizedVolatility(CustomFactor):
@@ -106,7 +104,7 @@ class AnnualizedVolatility(CustomFactor):
     _min_win = 2
 
     def compute(self, returns, annualization_factor):
-        return returns.std() * (annualization_factor ** .5)
+        return returns.nanstd() * (annualization_factor ** .5)
 
 
 MA = SimpleMovingAverage

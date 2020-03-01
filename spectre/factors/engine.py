@@ -1,14 +1,16 @@
 """
 @author: Heerozh (Zhang Jianhao)
-@copyright: Copyright 2019, Heerozh. All rights reserved.
+@copyright: Copyright 2019-2020, Heerozh. All rights reserved.
 @license: Apache 2.0
 @email: heeroz@gmail.com
 """
 from typing import Union, Iterable, Tuple
 import warnings
-from .factor import BaseFactor, DataFactor, FilterFactor, AdjustedDataFactor
-from .plotting import plot_quantile_and_cumulative_returns
-from .dataloader import DataLoader
+from .factor import BaseFactor
+from .filter import FilterFactor, StaticAssets
+from .datafactor import DataFactor, AdjustedDataFactor
+from ..plotting import plot_quantile_and_cumulative_returns, plot_chart
+from ..data import DataLoader
 from ..parallel import ParallelGroupBy
 import pandas as pd
 import numpy as np
@@ -16,7 +18,7 @@ import torch
 
 
 class OHLCV:
-    open = DataFactor(inputs=('',), is_data_after_market_close=False)
+    open = DataFactor(inputs=('',), should_delay=False)
     high = DataFactor(inputs=('',))
     low = DataFactor(inputs=('',))
     close = DataFactor(inputs=('',))
@@ -47,7 +49,7 @@ class FactorEngine:
             return self._column_cache[data_column]
 
         series = self._dataframe[data_column]
-        data = torch.from_numpy(series.values).pin_memory().to(self._device, non_blocking=True)
+        data = torch.from_numpy(series.values).to(self._device, non_blocking=True)
         self._column_cache[data_column] = data
         return data
 
@@ -64,9 +66,6 @@ class FactorEngine:
             cat = series.values
         keys = torch.tensor(cat, device=self._device, dtype=torch.int32)
         self._groups[as_group_name] = ParallelGroupBy(keys)
-
-    def create_tensor(self, group: str, dtype, values, nan_values) -> torch.Tensor:
-        return self._groups[group].create(dtype, values, nan_values)
 
     def revert_(self, data: torch.Tensor, group: str, factor_name: str) -> torch.Tensor:
         return self._groups[group].revert(data, factor_name)
@@ -98,10 +97,38 @@ class FactorEngine:
         self._groups = dict()
 
         # Get data
-        self._dataframe = self._loader.load(start, end, max_backwards)
+        df = self._loader.load(start, end, max_backwards).copy()
+        # If possible, pre-screen
+        if isinstance(self._filter, StaticAssets):
+            df = df.loc[(slice(None), self._filter.assets), :]
+            if df.shape[0] == 0:
+                raise ValueError("The assets {} specified by StaticAssets filter, was not found in "
+                                 "DataLoader.".format(self._filter.assets))
+        # check history data is insufficient
+        df.index = df.index.remove_unused_levels()
+        history_win = df.index.levels[0].get_loc(start, 'bfill')
+        if history_win < max_backwards:
+            warnings.warn("Historical data seems insufficient. "
+                          "{} rows of historical data are required, but only {} rows are obtained. "
+                          "It is also possible that `calender_asset` of the loader is not set, "
+                          "some out of trading hours data will cause indexing problems."
+                          .format(max_backwards, history_win),
+                          RuntimeWarning)
+        # post processing data
+        if self._align_by_time:
+            # since pandas 0.23, MultiIndex reindex is slow, so using a alternative way here,
+            # but still very slow.
+            # df = df.reindex(pd.MultiIndex.from_product(df.index.levels))
+            df = df.unstack(level=1).stack(dropna=False)
+        if self.timezone != 'UTC':
+            df = df.reset_index('asset').tz_convert(self.timezone)\
+                .set_index(['asset'], append=True)
+
+        self._dataframe = df
+        self._dataframe_index = [df.index.get_level_values(i) for i in range(len(df.index.levels))]
 
         # asset group
-        cat = self._dataframe.index.get_level_values(1).codes
+        cat = self._dataframe_index[1].codes
         keys = torch.tensor(cat, device=self._device, dtype=torch.int32)
         self._groups['asset'] = ParallelGroupBy(keys)
 
@@ -109,10 +136,17 @@ class FactorEngine:
         self.column_to_parallel_groupby_(self._loader.time_category, 'date')
 
         self._column_cache = {}
-        self._last_load = [start, end, max_backwards]
+        if isinstance(self._filter, StaticAssets):
+            # if pre-screened, don't cache data, only cache full data.
+            self._last_load = [None, None, None]
+        else:
+            self._last_load = [start, end, max_backwards]
 
     def _compute_and_revert(self, f: BaseFactor, name) -> torch.Tensor:
-        data = f.compute_(None)
+        stream = None
+        if self._device.type == 'cuda' and self._enable_stream:
+            stream = torch.cuda.current_stream()
+        data = f.compute_(stream)
         return self._groups[f.groupby].revert(data, name)
 
     # public:
@@ -120,16 +154,34 @@ class FactorEngine:
     def __init__(self, loader: DataLoader) -> None:
         self._loader = loader
         self._dataframe = None
+        self._dataframe_index = None
         self._groups = dict()
         self._last_load = [None, None, None]
         self._column_cache = {}
         self._factors = {}
         self._filter = None
         self._device = torch.device('cpu')
+        self._enable_stream = False
+        self._align_by_time = False
+        self.timezone = 'UTC'
 
     @property
     def device(self):
         return self._device
+
+    @property
+    def dataframe_index(self):
+        return self._dataframe_index
+
+    def create_tensor(self, group: str, dtype, values, nan_values) -> torch.Tensor:
+        return self._groups[group].create(dtype, values, nan_values)
+
+    def set_align_by_time(self, enable: bool):
+        """
+        If `enable` is `True`, df index will be the product of 'date' and 'asset'.
+        This method is slow, recommended to do it in your DataLoader in advance.
+        """
+        self._align_by_time = enable
 
     def add(self,
             factor: Union[Iterable[BaseFactor], BaseFactor],
@@ -164,13 +216,44 @@ class FactorEngine:
     def remove_all_factors(self) -> None:
         self._factors = {}
 
-    def to_cuda(self) -> None:
+    def to_cuda(self, enable_stream=False) -> None:
+        """
+        Set enable_stream to True allows pipeline branches to calculation simultaneously.
+        However, this will lead to more VRAM usage and may affect performance.
+        """
         self._device = torch.device('cuda')
         self._last_load = [None, None, None]
+        self._enable_stream = enable_stream
 
     def to_cpu(self) -> None:
         self._device = torch.device('cpu')
         self._last_load = [None, None, None]
+
+    def test_lookahead_bias(self, start, end):
+        """Check all factors, if there are look-ahead bias"""
+        start, end = pd.to_datetime(start, utc=True), pd.to_datetime(end, utc=True)
+        # get results
+        df_expected = self.run(start, end)
+        # modify future data
+        dt_index = self._dataframe[start:].index.get_level_values(0).unique()
+        mid = int(len(dt_index) / 2)
+        mid_left = dt_index[mid-1]
+        mid_right = dt_index[mid]
+        length = self._dataframe.loc[mid_right:].shape[0]
+        for col in self._loader.ohlcv:
+            self._dataframe.loc[mid_right:, col] = np.random.randn(length)
+        self._column_cache = {}
+        # check if results are consistent
+        df = self.run(start, end)
+        # clean
+        self._column_cache = {}
+        self._last_load = [None, None, None]
+
+        try:
+            pd.testing.assert_frame_equal(df_expected[:mid_left], df[:mid_left])
+        except AssertionError:
+            raise RuntimeError('A look-ahead bias was detected, please check your factors code')
+        return 'No assertion raised.'
 
     def run(self, start: Union[str, pd.Timestamp], end: Union[str, pd.Timestamp],
             delay_factor=True) -> pd.DataFrame:
@@ -180,13 +263,13 @@ class FactorEngine:
         if len(self._factors) == 0:
             raise ValueError('Please add at least one factor to engine, then run again.')
 
-        if not delay_factor:
-            for c, f in self._factors.items():
-                if f.include_close_data():
-                    warnings.warn("Warning!! delay_factor is set to False, "
-                                  "but {} factor uses data that is only available "
-                                  "after the market is closed.".format(c),
-                                  RuntimeWarning)
+        delays = {col for col, fct in self._factors.items() if fct.should_delay()}
+        if not delay_factor and len(delays) > 0:
+            warnings.warn("Warning!! delay_factor is set to False, "
+                          "but {} factors uses data that is only available "
+                          "after the market is closed.".format(str(delays)),
+                          RuntimeWarning)
+            delays = {}
 
         start, end = pd.to_datetime(start, utc=True), pd.to_datetime(end, utc=True)
         # make columns to data factors.
@@ -197,60 +280,62 @@ class FactorEngine:
             OHLCV.close.inputs = (self._loader.ohlcv[3], self._loader.adjustment_multipliers[0])
             OHLCV.volume.inputs = (self._loader.ohlcv[4], self._loader.adjustment_multipliers[1])
 
-        # get factor
+        # shift factors if necessary
         filter_ = self._filter
-        if filter_ and delay_factor:
+        if filter_ and filter_.should_delay() and delay_factor:
             filter_ = filter_.shift(1)
-        factors = {c: delay_factor and f.shift(1) or f for c, f in self._factors.items()}
+        factors = {col: col in delays and fct.shift(1) or fct
+                   for col, fct in self._factors.items()}
 
-        # Calculate data that requires backwards in tree
+        # calculate how much historical data is needed
         max_backwards = max([f.get_total_backwards_() for f in factors.values()])
         if filter_:
             max_backwards = max(max_backwards, filter_.get_total_backwards_())
-        # Get data
+
+        # copy data to tensor
         self._prepare_tensor(start, end, max_backwards)
 
-        # ready to compute
+        # clean up before start (may be keyboard interrupted)
+        if filter_:
+            filter_.clean_up_()
+        for f in factors.values():
+            f.clean_up_()
+
+        # some pre-work
         if filter_:
             filter_.pre_compute_(self, start, end)
         for f in factors.values():
             f.pre_compute_(self, start, end)
 
-        # if cuda, parallel compute filter and sync
-        if filter_ and self._device.type == 'cuda':
-            stream = torch.cuda.Stream(device=self._device)
-            filter_.compute_(stream)
-            torch.cuda.synchronize(device=self._device)
-
-        # pre compute no shift filter for mask
-        if self._filter:
-            filter_.compute_(None)
-
-        # if cuda, parallel compute factors and sync
-        if self._device.type == 'cuda':
-            stream = torch.cuda.Stream(device=self._device)
-            for col, fct in factors.items():
-                fct.compute_(stream)
-            torch.cuda.synchronize(device=self._device)
-
-        # compute factors from cpu or read cache
-        ret = pd.DataFrame(index=self._dataframe.index.copy())
-        ret = ret.assign(**{c: self._compute_and_revert(f, c).cpu().numpy()
-                            for c, f in factors.items()})
-
-        # Remove filter False rows
+        # schedule possible gpu work first
+        results = {col: self._compute_and_revert(fct, col) for col, fct in factors.items()}
+        shifted_mask = None
         if filter_:
-            shift_mask = self._compute_and_revert(filter_, 'filter')
-            ret = ret[shift_mask.cpu().numpy()]
+            shifted_mask = self._compute_and_revert(filter_, 'filter')
+        # do cpu work and synchronize will automatically done by torch
+        ret = pd.DataFrame(index=self._dataframe.index.copy())
+        ret = ret.assign(**{col: t.cpu().numpy() for col, t in results.items()})
+        if filter_:
+            ret = ret[shifted_mask.cpu().numpy()]
 
-        index = ret.index.levels[0]
-        start = index.get_loc(start, 'bfill')
-        if delay_factor:
-            start += 1
-        return ret.loc[index[start]:]
+        # do clean up again
+        if filter_:
+            filter_.clean_up_()
+        for f in factors.values():
+            f.clean_up_()
+
+        # if any factors delayed, return df also should be delayed
+        if delays:
+            index = ret.index.levels[0]
+            start_ind = index.get_loc(start, 'bfill')
+            start = index[start_ind + 1]
+        return ret.loc[start:]
 
     def get_factors_raw_value(self):
-        return {c: f.compute_(None) for c, f in self._factors.items()}
+        stream = None
+        if self._device.type == 'cuda':
+            stream = torch.cuda.current_stream()
+        return {c: f.compute_(stream) for c, f in self._factors.items()}
 
     def get_price_matrix(self,
                          start: Union[str, pd.Timestamp],
@@ -267,7 +352,7 @@ class FactorEngine:
         factors_backup = self._factors
         self._factors = {'price': AdjustedDataFactor(prices)}
 
-        # get ticker s first
+        # get tickers first
         assets = None
         if self._filter is not None:
             with warnings.catch_warnings():
@@ -276,7 +361,7 @@ class FactorEngine:
             assets = assets_ret.index.get_level_values(1).unique()
 
         filter_backup = self._filter
-        self._filter = None
+        self._filter = StaticAssets(assets)
         with warnings.catch_warnings():
             warnings.simplefilter("ignore")
             ret = self.run(start, end, delay_factor=False)
@@ -284,12 +369,41 @@ class FactorEngine:
         self._filter = filter_backup
 
         ret = ret['price'].unstack(level=[1])
-        if assets is not None:
-            ret = ret[assets]
         return ret
 
+    def plot_chart(self, start, end, trace_types=None, styles=None, delay_factor=True):
+        """
+        Plotting common stock price chart for researching.
+        :param start: same as engine.run()
+        :param end: same as engine.run()
+        :param delay_factor: same as engine.run()
+        :param trace_types: dict(factor_name=plotly_trace_type), default is 'Scatter'
+        :param styles: dict(factor_name=plotly_trace_styles)
+
+        Usage::
+
+            engine = factors.FactorEngine(loader)
+            engine.timezone = 'America/New_York'
+            engine.set_filter(factors.StaticAssets({'NVDA', 'MSFT'}))
+            engine.add(factors.MA(20), 'MA20')
+            engine.add(factors.RSI(), 'RSI')
+            engine.to_cuda()
+            engine.plot_chart('2017', '2018', styles={
+                'MA20': {
+                          'line': {'dash': 'dash'}
+                       },
+                'RSI': {
+                          'yaxis': 'y3',
+                          'line': {'width': 1}
+                       }
+            })
+
+        """
+        df = self.run(start, end, delay_factor)
+        plot_chart(self._dataframe, self.loader_.ohlcv, df, trace_types=trace_types, styles=styles)
+
     def full_run(self, start, end, trade_at='close', periods=(1, 4, 9),
-                 quantiles=5, filter_zscore=20, preview=True
+                 quantiles=5, filter_zscore=20, demean=True, preview=True
                  ) -> Tuple[pd.DataFrame, pd.DataFrame]:
         """
         Return this:
@@ -298,20 +412,20 @@ class FactorEngine:
         |---------------------------|-------|-----------|-----------|-------------------|
         |2014-01-08 00:00:00+00:00	|ARNC	|0.070159	|0.215274	|5                  |
         |                           |BA	    |-0.038556	|-1.638784	|1                  |
-        for alphalens analysis, you can use this:
+        For alphalens analysis, you can use this:
         factor_data = full_run_return[['factor_name', 'Returns']].droplevel(0, axis=1)
         al.tears.create_returns_tear_sheet(factor_data)
-        :param str, pd.Timestamp start: factor analysis start time
-        :param str, pd.Timestamp end: factor analysis end time
-        :param trade_at: which price for forward returns. 'open', or 'close.
+        :param str, pd.Timestamp start: Factor analysis start time
+        :param str, pd.Timestamp end: Factor analysis end time
+        :param trade_at: Which price for forward returns. 'open', or 'close.
                          If is 'current_close', same as run engine with delay_factor=False,
-                         Meaning use the factor to trade on the same day it generated. Be sure that
-                         no any high,low,close data is used in factor, otherwise will cause
-                         lookahead bias.
-        :param periods: forward return periods
-        :param quantiles: number of quantile
-        :param filter_zscore: drop extreme factor return, for stability of the analysis.
-        :param preview: display a preview chart of the result
+                         Be sure that no any high,low,close data is used in factor, otherwise will
+                         cause lookahead bias.
+        :param periods: Forward return periods
+        :param quantiles: Number of quantile
+        :param filter_zscore: Drop extreme factor return, for stability of the analysis.
+        :param demean: Whether the factor is converted into a hedged weight: sum(weight) = 0
+        :param preview: Display a preview chart of the result
         """
         factors = self._factors.copy()
         universe = self.get_filter()
@@ -320,7 +434,7 @@ class FactorEngine:
         # add quantile factor of all factors
         for c, f in factors.items():
             self.add(f.quantile(quantiles, mask=universe), c + '_q_')
-            self.add(f.to_weight(mask=universe), c + '_w_')
+            self.add(f.to_weight(mask=universe, demean=demean), c + '_w_')
             column_names[c] = (c, 'factor')
             column_names[c + '_q_'] = (c, 'factor_quantile')
             column_names[c + '_w_'] = (c, 'factor_weight')
@@ -334,14 +448,17 @@ class FactorEngine:
             shift = 0
         from .basic import Returns
         for n in periods:
-            # Different: returns here diff by tick, which alphalens diff by time
+            # Different: returns here diff by bar, which alphalens diff by time
             ret = Returns(win=n + 1, inputs=inputs).shift(-n + shift)
             mask = universe
             if filter_zscore is not None:
                 # Different: The zscore here contains all backward data which alphalens not counted.
                 zscore_factor = ret.zscore(axis_asset=True, mask=universe)
                 zscore_filter = zscore_factor.abs() <= filter_zscore
-                mask = mask & zscore_filter
+                if mask is not None:
+                    mask = mask & zscore_filter
+                else:
+                    mask = zscore_filter
                 self.add(ret.filter(mask), str(n) + '_r_')
             else:
                 self.add(ret, str(n) + '_r_')
@@ -379,7 +496,7 @@ class FactorEngine:
                 demean_col = ('Demeaned', period_col)
                 mean_col = (fact_name, period_col)
                 mean_return[mean_col] = grouped_mean[demean_col]
-        mean_return.index.levels[0].name = 'quantile'
+        mean_return.index.set_names('quantile', level=0)
         mean_return = mean_return.groupby(level=0).agg(['mean', 'sem'])
         mean_return.sort_index(axis=1, inplace=True)
 

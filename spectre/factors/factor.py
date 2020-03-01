@@ -1,6 +1,6 @@
 """
 @author: Heerozh (Zhang Jianhao)
-@copyright: Copyright 2019, Heerozh. All rights reserved.
+@copyright: Copyright 2019-2020, Heerozh. All rights reserved.
 @license: Apache 2.0
 @email: heeroz@gmail.com
 """
@@ -8,7 +8,8 @@ from abc import ABC
 from typing import Optional, Sequence, Union
 import numpy as np
 import torch
-from ..parallel import nansum, nanmean, nanstd, nanlast, Rolling
+from ..parallel import nansum, nanmean, nanstd, pad_2d, Rolling
+from ..plotting import plot_factor_diagram
 
 
 class BaseFactor:
@@ -18,52 +19,103 @@ class BaseFactor:
 
     # --------------- overload ops ---------------
 
+    # op: +
     def __add__(self, other):
         return AddFactor(inputs=(self, other))
 
+    def __radd__(self, other):
+        return AddFactor(inputs=(other, self))
+
+    # op: -
     def __sub__(self, other):
         return SubFactor(inputs=(self, other))
 
+    def __rsub__(self, other):
+        return SubFactor(inputs=(other, self))
+
+    # op: *
     def __mul__(self, other):
         return MulFactor(inputs=(self, other))
 
+    def __rmul__(self, other):
+        return MulFactor(inputs=(other, self))
+
+    # op: /
     def __truediv__(self, other):
         return DivFactor(inputs=(self, other))
 
-    # __mod__
+    def __rtruediv__(self, other):
+        return DivFactor(inputs=(other, self))
 
+    # op: %
+    def __mod__(self, other):
+        return ModFactor(inputs=(self, other))
+
+    def __rmod__(self, other):
+        return ModFactor(inputs=(other, self))
+
+    # op: **
     def __pow__(self, other):
         return PowFactor(inputs=(self, other))
 
+    def __rpow__(self, other):
+        return PowFactor(inputs=(other, self))
+
+    # op: negative
     def __neg__(self):
         return NegFactor(inputs=(self,))
 
+    # op: and
     def __and__(self, other):
+        from .filter import AndFactor
         return AndFactor(inputs=(self, other))
 
+    def __rand__(self, other):
+        from .filter import AndFactor
+        return AndFactor(inputs=(other, self))
+
+    # op: or
     def __or__(self, other):
+        from .filter import OrFactor
         return OrFactor(inputs=(self, other))
 
+    def __ror__(self, other):
+        from .filter import OrFactor
+        return OrFactor(inputs=(other, self))
+
+    # op: <=>==!=
     def __lt__(self, other):
+        from .filter import LtFactor
         return LtFactor(inputs=(self, other))
 
     def __le__(self, other):
+        from .filter import LeFactor
         return LeFactor(inputs=(self, other))
 
     def __gt__(self, other):
+        from .filter import GtFactor
         return GtFactor(inputs=(self, other))
 
     def __ge__(self, other):
+        from .filter import GeFactor
         return GeFactor(inputs=(self, other))
 
     def __eq__(self, other):
+        from .filter import EqFactor
         return EqFactor(inputs=(self, other))
 
     def __ne__(self, other):
+        from .filter import NeFactor
         return NeFactor(inputs=(self, other))
 
+    # op: ~
     def __invert__(self):
+        from .filter import InvertFactor
         return InvertFactor(inputs=(self,))
+
+    # op: []
+    def __getitem__(self, key):
+        return MultiRetSelector(inputs=(self, key))
 
     # --------------- helper functions ---------------
 
@@ -74,18 +126,17 @@ class BaseFactor:
         return self.rank(ascending=True, mask=mask) <= n
 
     def rank(self, ascending=True, mask: 'BaseFactor' = None):
-        factor = RankFactor(inputs=(self,))
+        factor = RankFactor(inputs=(self,), mask=mask)
         # factor.method = method
         factor.ascending = ascending
-        factor.set_mask(mask)
         return factor
 
     def zscore(self, axis_asset=False, mask: 'BaseFactor' = None):
         if axis_asset:
             factor = AssetZScoreFactor(inputs=(self,))
+            factor.set_mask(mask)
         else:
-            factor = ZScoreFactor(inputs=(self,))
-        factor.set_mask(mask)
+            factor = ZScoreFactor(inputs=(self,), mask=mask)
         return factor
 
     def demean(self, groupby: Union[str, dict] = None, mask: 'BaseFactor' = None):
@@ -95,25 +146,23 @@ class BaseFactor:
         dict groupby will interrupt the parallelism of cuda, it is recommended to add group key to
         the Dataloader as a column, or use it only in the last step.
         """
-        factor = DemeanFactor(inputs=(self,))
+        factor = DemeanFactor(inputs=(self,), mask=mask)
         if isinstance(groupby, str):
             factor.groupby = groupby
         elif isinstance(groupby, dict):
             factor.group_dict = groupby
         elif groupby is not None:
             raise ValueError()
-        factor.set_mask(mask)
         return factor
 
     def quantile(self, bins=5, mask: 'BaseFactor' = None):
-        factor = QuantileFactor(inputs=(self,))
+        factor = QuantileFactor(inputs=(self,), mask=mask)
         factor.bins = bins
-        factor.set_mask(mask)
         return factor
 
-    def to_weight(self, mask: 'BaseFactor' = None):
-        factor = ToWeightFactor(inputs=(self,))
-        factor.set_mask(mask)
+    def to_weight(self, demean=True, mask: 'BaseFactor' = None):
+        factor = ToWeightFactor(inputs=(self,), mask=mask)
+        factor.demean = demean
         return factor
 
     def shift(self, periods=1):
@@ -124,12 +173,41 @@ class BaseFactor:
     def abs(self):
         return AbsFactor(inputs=(self,))
 
+    def sum(self, win):
+        return SumFactor(win, inputs=(self,))
+
     def filter(self, mask):
         mf = DoNothingFactor(inputs=(self,))
         mf.set_mask(mask)
         return mf
 
+    def one_hot(self):
+        from .filter import OneHotEncoder
+        factor = OneHotEncoder(self)
+        return factor
+
+    def fill_na(self, value=None, ffill=None):
+        if value is not None:
+            factor = FillNANFactor(inputs=(self, value))
+        elif ffill:
+            factor = PadFactor(inputs=(self,))
+        else:
+            raise ValueError('Either `value=number` or `ffill=True` must be specified.')
+        return factor
+
+    fill_nan = fill_na
+
+    def any(self, win):
+        return AnyFactor(win, inputs=(self,))
+
+    def all(self, win):
+        return AllFactor(win, inputs=(self,))
+
     # --------------- main methods ---------------
+    @property
+    def adjustments(self):
+        """Returning adjustments multipliers"""
+        return None
 
     def _regroup_by_other(self, factor, factor_out):
         if factor.groupby != self.groupby:
@@ -147,12 +225,16 @@ class BaseFactor:
     def get_total_backwards_(self) -> int:
         raise NotImplementedError("abstractmethod")
 
-    def include_close_data(self) -> bool:
+    def should_delay(self) -> bool:
+        """Is this factor should be delayed?"""
         return False
 
     def pre_compute_(self, engine: 'FactorEngine', start, end) -> None:
         self._engine = engine
         engine.column_to_parallel_groupby_(self.groupby)
+
+    def clean_up_(self) -> None:
+        self._engine = None
 
     def compute_(self, stream: Union[torch.cuda.Stream, None]) -> torch.Tensor:
         raise NotImplementedError("abstractmethod")
@@ -174,9 +256,10 @@ class CustomFactor(BaseFactor):
 
     # internal member variables
     _cache = None
-    _cache_hit = 0
+    _ref_count = 0
     _cache_stream = None
     _mask = None
+    _force_delay = None
 
     def __init__(self, win: Optional[int] = None, inputs: Optional[Sequence[BaseFactor]] = None):
         """
@@ -193,6 +276,8 @@ class CustomFactor(BaseFactor):
             self.win = win
         if inputs:
             self.inputs = inputs
+        assert isinstance(self.inputs, (list, tuple, type(None))), '`factor.inputs` must be a list.'
+        assert isinstance(self.win, int), '`factor.win` must be a integer.'
 
         assert (self.win >= (self._min_win or 1))
 
@@ -204,7 +289,7 @@ class CustomFactor(BaseFactor):
         backwards = 0
         if self.inputs:
             backwards = max([up.get_total_backwards_() for up in self.inputs
-                            if isinstance(up, BaseFactor)] or (0,))
+                             if isinstance(up, BaseFactor)] or (0,))
         backwards = backwards + self.win - 1
 
         if self._mask:
@@ -213,14 +298,37 @@ class CustomFactor(BaseFactor):
         else:
             return backwards
 
-    def include_close_data(self) -> bool:
-        ret = super().include_close_data()
+    def should_delay(self) -> bool:
+        ret = super().should_delay()
+        if self._force_delay is not None:
+            return self._force_delay
         if self.inputs:
             for upstream in self.inputs:
                 if isinstance(upstream, BaseFactor):
-                    up_ret = upstream.include_close_data()
+                    up_ret = upstream.should_delay()
                     ret = max(ret, up_ret)
         return ret
+
+    def set_delay(self, delay):
+        """None: Auto delay. False: Force not to delay. True: Force to delay."""
+        self._force_delay = delay
+
+    def show_graph(self):
+        plot_factor_diagram(self)
+
+    def clean_up_(self) -> None:
+        super().clean_up_()
+        self._cache = None
+        self._cache_stream = None
+        self._ref_count = 0
+
+        if self.inputs:
+            for upstream in self.inputs:
+                if isinstance(upstream, BaseFactor):
+                    upstream.clean_up_()
+
+        if self._mask is not None:
+            self._mask.clean_up_()
 
     def pre_compute_(self, engine, start, end) -> None:
         """
@@ -228,8 +336,11 @@ class CustomFactor(BaseFactor):
         """
         super().pre_compute_(engine, start, end)
         self._cache = None
-        self._cache_hit = 0
         self._cache_stream = None
+
+        self._ref_count += 1
+        if self._ref_count > 1:  # already pre_compute_ed, skip child
+            return
         if self.inputs:
             for upstream in self.inputs:
                 if isinstance(upstream, BaseFactor):
@@ -248,26 +359,30 @@ class CustomFactor(BaseFactor):
 
         # if need rolling and adjustment
         if self.win > 1:
-            adj_multi = None
-            if isinstance(upstream, DataFactor):
-                adj_multi = upstream.adjustments
-            ret = Rolling(ret, self.win, adj_multi)
-        # elif isinstance(upstream, DataFactor):
-        #     # 不需要adjustment了，不rolling就是获取当前的数据直接出fct，就不用adj了
+            ret = Rolling(ret, self.win, upstream.adjustments)
         return ret
 
     def compute_(self, down_stream: Union[torch.cuda.Stream, None]) -> torch.Tensor:
+        # return cached result
+        self._ref_count -= 1
+        if self._ref_count < 0:
+            raise ValueError('Reference count error: Maybe you override `pre_compute_`, '
+                             'but did not call super() method.')
         if self._cache is not None:
-            self._cache_hit += 1
             if down_stream:
                 down_stream.wait_event(self._cache_stream.record_event())
-            return self._cache
+            ret = self._cache
+            if self._ref_count == 0:
+                self._cache = None
+                self._cache_stream = None
+            return ret
 
         # create self stream
         self_stream = None
         if down_stream:
             self_stream = torch.cuda.Stream(device=down_stream.device)
-            self._cache_stream = self_stream
+            if self._ref_count > 0:
+                self._cache_stream = self_stream
 
         # Calculate mask
         mask_out = None
@@ -294,44 +409,45 @@ class CustomFactor(BaseFactor):
             down_stream.wait_event(self_stream.record_event())
         else:
             out = self.compute(*inputs)
-        self._cache = out
+
+        if self._ref_count > 0:
+            self._cache = out
         return out
 
     def compute(self, *inputs: Sequence[torch.Tensor]) -> torch.Tensor:
         """
         Abstractmethod, do the actual factor calculation here.
-        Unlike zipline, here calculate all data at once. Does not guarantee Look-Ahead Bias.
+        Unlike zipline, here we will receive all data, you need to be careful to prevent
+        Look-Ahead Bias.
 
         `inputs` Data structure:
-        For parallel, the data structure is designed for optimal performance.
+        The data structure is designed for optimal performance in parallel.
         * Groupby `asset`(default):
-            set N = individual asset tick count, Max = Max tick count of all asset
+            set N = individual asset bar count, Max = Max bar count across all asset
             win = 1:
                 | asset id | price(t+0) | ... | price(t+N) | price(t+N+1) | ... | price(t+Max) |
                 |----------|------------|-----|------------|--------------|-----|--------------|
                 |     0    | 123.45     | ... | 234.56     | NaN          | ... | Nan          |
-                The price is sorted by tick, not by time, so it won't be aligned by time and got NaN
-                values in the middle of prices (unless tick value itself is NaN), NaNs all put at
-                the end of the row.
+                If `align_by_time=False` then the time represented by each bar is different.
             win > 1:
-                Gives you a rolling object `r`, you can `r.mean()`, `r.sum()`, or `r.agg()`
+                Gives you a rolling object `r`, you can `r.mean()`, `r.sum()`, or `r.agg()`.
                 `r.agg(callback)` gives you raw data structure as:
-                | asset id | Rolling tick | price(t+0) | ... | price(t+Win) |
+                | asset id | Rolling bar  | price(t+0) | ... | price(t+Win) |
                 |----------|--------------|------------|-----|--------------|
                 |     0    | 0            | NaN        | ... | 123.45       |
                 |          | ...          | ...        | ... | ...          |
                 |          | N            | xxx.xx     | ... | 234.56       |
-                If this table too big, it will split to multiple tables and call the callback
-                function separately.
+                If this table too big, it will split to multiple tables by axis 0, and call the
+                callback function separately.
         * Groupby `date` or others (set `groupby = 'date'`):
             set N = asset count, Max = Max asset count in all time
                 | time id  | price(t+0) | ... | price(t+N) | price(t+N+1) | ... | price(t+Max) |
                 |----------|------------|-----|------------|--------------|-----|--------------|
                 |     0    | 100.00     | ... | 200.00     | NaN          | ... | Nan          |
-                The prices is all asset price in same tick time, this is useful for calculations
+                The prices is all asset prices in same time, this is useful for calculations
                 such as rank, quantile.
-                But the order of assets in each row (time) is random, so the column cannot be
-                considered as a particular asset.
+                If `align_by_time=False` then the order of assets in each row (time) is not fixed,
+                in that way the column cannot be considered as a particular asset.
         * Custom:
             Use `series = self._revert_to_series(input)` you can get `pd.Series` data type, and
             manipulate by your own. Remember to call `return self._regroup(series)` when returning.
@@ -342,76 +458,30 @@ class CustomFactor(BaseFactor):
         raise NotImplementedError("abstractmethod")
 
 
-class FilterFactor(CustomFactor, ABC):
-    def shift(self, periods=1):
-        factor = FilterShiftFactor(inputs=(self,))
-        factor.periods = periods
-        return factor
-
-
-class DataFactor(BaseFactor):
-    def __init__(self, inputs: Optional[Sequence[str]] = None,
-                 is_data_after_market_close=True) -> None:
-        super().__init__()
-        if inputs:
-            self.inputs = inputs
-        assert (3 > len(self.inputs) > 0), \
-            "DataFactor's `inputs` can only contains one data column and corresponding " \
-            "adjustments column"
-        self._data = None
-        self._multi = None
-        self.is_data_after_market_close = is_data_after_market_close
-
-    @property
-    def adjustments(self):
-        return self._multi
-
-    def get_total_backwards_(self) -> int:
-        return 0
-
-    def include_close_data(self) -> bool:
-        return self.is_data_after_market_close
-
-    def pre_compute_(self, engine: 'FactorEngine', start, end) -> None:
-        super().pre_compute_(engine, start, end)
-        self._data = engine.column_to_tensor_(self.inputs[0])
-        self._data = engine.group_by_(self._data, self.groupby)
-        if len(self.inputs) > 1 and self.inputs[1] in engine.dataframe_:
-            self._multi = engine.column_to_tensor_(self.inputs[1])
-            self._multi = engine.group_by_(self._multi, self.groupby)
-        else:
-            self._multi = None
-
-    def compute_(self, stream: Union[torch.cuda.Stream, None]) -> torch.Tensor:
-        return self._data
-
-    def compute(self, *inputs: Sequence[torch.Tensor]) -> torch.Tensor:
-        pass
-
-
-class AdjustedDataFactor(CustomFactor):
-    def __init__(self, data: DataFactor):
-        super().__init__(1, (data,))
-        self.parent = data
-
-    def compute(self, data) -> torch.Tensor:
-        multi = self.parent.adjustments
-        if multi is None:
-            return data
-        return data * multi / nanlast(multi, dim=1)[:, None]
-
-
 class TimeGroupFactor(CustomFactor, ABC):
     """Class that inputs and return value is grouped by datetime"""
     groupby = 'date'
     win = 1
 
-    def __init__(self, win: Optional[int] = None, inputs: Optional[Sequence[BaseFactor]] = None):
+    def __init__(self, win: Optional[int] = None, inputs: Optional[Sequence[BaseFactor]] = None,
+                 mask: Optional[BaseFactor] = None):
         super().__init__(win, inputs)
-        assert self.win == 1, 'TimeGroupFactor can only be win=1'
+        self.set_mask(mask)
+        assert self.win == 1, 'TimeGroupFactor.win can only be 1'
 
 
 # --------------- helper factors ---------------
+
+
+class MultiRetSelector(CustomFactor):
+
+    def compute(self, data: torch.Tensor, key) -> torch.Tensor:
+        if len(data.shape) < 3:
+            raise KeyError('This factor has only one return value, cannot slice.')
+        elif data.shape[2] <= key:
+            raise KeyError('OutOfBounds: factor has only {} return values, and slice is [{}].'.
+                           format(data.shape[2], key))
+        return data[:, :, key]
 
 
 class ShiftFactor(CustomFactor):
@@ -431,23 +501,41 @@ class AbsFactor(CustomFactor):
         return data.abs()
 
 
+class SumFactor(CustomFactor):
+    _min_win = 2
+
+    def compute(self, data: Rolling) -> torch.Tensor:
+        return data.nansum()
+
+
+class AnyFactor(CustomFactor):
+    _min_win = 2
+
+    def compute(self, data: Rolling) -> torch.Tensor:
+        return ~torch.isnan(data.values).any(dim=2)
+
+
+class AllFactor(CustomFactor):
+    _min_win = 2
+
+    def compute(self, data: Rolling) -> torch.Tensor:
+        return ~torch.isnan(data.values).all(dim=2)
+
+
+class PadFactor(CustomFactor):
+    def compute(self, data: torch.Tensor) -> torch.Tensor:
+        return pad_2d(data)
+
+
+class FillNANFactor(CustomFactor):
+    def compute(self, data: torch.Tensor, value) -> torch.Tensor:
+        mask = torch.isnan(data)
+        return data.masked_fill(mask, value)
+
+
 class DoNothingFactor(CustomFactor):
     def compute(self, data: torch.Tensor) -> torch.Tensor:
         return data
-
-
-class FilterShiftFactor(CustomFactor):
-    """For "roll_cuda" not implemented for 'Bool' """
-    periods = 1
-
-    def compute(self, data: torch.Tensor) -> torch.Tensor:
-        shift = data.char().roll(self.periods, dims=1)
-        if self.periods > 0:
-            shift[:, 0:self.periods] = 0
-        else:
-            shift[:, self.periods:] = 0
-
-        return shift.bool()
 
 
 class RankFactor(TimeGroupFactor):
@@ -462,7 +550,7 @@ class RankFactor(TimeGroupFactor):
         _, indices = torch.sort(filled, dim=1, descending=not self.ascending)
         _, indices = torch.sort(indices, dim=1)
         rank = indices.float() + 1.
-        rank[torch.isnan(data)] = np.nan
+        rank.masked_fill_(torch.isnan(data), np.nan)
         return rank
 
 
@@ -494,10 +582,14 @@ class AssetZScoreFactor(CustomFactor):
 
 
 class QuantileFactor(TimeGroupFactor):
-    """return the quantile that factor belongs to each tick"""
+    """Returns the quantile of the factor at each datetime"""
     bins = 5
 
     def compute(self, data: torch.Tensor) -> torch.Tensor:
+        if data.dtype == torch.bool:
+            data = data.char()
+        if data.shape[1] == 1:  # if only one asset in universe
+            return data.new_full(data.shape, 0, dtype=torch.float32)
         x, _ = torch.sort(data, dim=1)
         mask = torch.isnan(data)
         act_size = data.shape[1] - mask.sum(dim=1)
@@ -522,9 +614,12 @@ class QuantileFactor(TimeGroupFactor):
 
 
 class ToWeightFactor(TimeGroupFactor):
+    demean = True
+
     def compute(self, data: torch.Tensor) -> torch.Tensor:
-        demean = data - nanmean(data)[:, None]
-        return demean / nansum(demean.abs(), dim=1)[:, None]
+        if self.demean:
+            data = data - nanmean(data)[:, None]
+        return data / nansum(data.abs(), dim=1)[:, None]
 
 
 # --------------- op factors ---------------
@@ -550,6 +645,11 @@ class DivFactor(CustomFactor):
         return left / right
 
 
+class ModFactor(CustomFactor):
+    def compute(self, left, right) -> torch.Tensor:
+        return left % right
+
+
 class PowFactor(CustomFactor):
     def compute(self, left, right) -> torch.Tensor:
         return left ** right
@@ -558,48 +658,3 @@ class PowFactor(CustomFactor):
 class NegFactor(CustomFactor):
     def compute(self, left) -> torch.Tensor:
         return -left
-
-
-class InvertFactor(FilterFactor):
-    def compute(self, left) -> torch.Tensor:
-        return ~left
-
-
-class OrFactor(FilterFactor):
-    def compute(self, left, right) -> torch.Tensor:
-        return left | right
-
-
-class AndFactor(FilterFactor):
-    def compute(self, left, right) -> torch.Tensor:
-        return left & right
-
-
-class LtFactor(FilterFactor):
-    def compute(self, left, right) -> torch.Tensor:
-        return torch.lt(left, right)
-
-
-class LeFactor(FilterFactor):
-    def compute(self, left, right) -> torch.Tensor:
-        return torch.le(left, right)
-
-
-class GtFactor(FilterFactor):
-    def compute(self, left, right) -> torch.Tensor:
-        return torch.gt(left, right)
-
-
-class GeFactor(FilterFactor):
-    def compute(self, left, right) -> torch.Tensor:
-        return torch.ge(left, right)
-
-
-class EqFactor(FilterFactor):
-    def compute(self, left, right) -> torch.Tensor:
-        return torch.eq(left, right)
-
-
-class NeFactor(FilterFactor):
-    def compute(self, left, right) -> torch.Tensor:
-        return torch.ne(left, right)

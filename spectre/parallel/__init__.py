@@ -3,6 +3,13 @@ from .algorithmic import (
     Rolling,
     nansum,
     nanmean,
+    nanvar,
     nanstd,
     nanlast,
+    nanmax,
+    nanmin,
+    pad_2d,
+    covariance,
+    pearsonr,
+    linear_regression_1d,
 )

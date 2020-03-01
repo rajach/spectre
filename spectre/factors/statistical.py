@@ -6,6 +6,8 @@
 """
 from .factor import CustomFactor
 from .engine import OHLCV
+from ..parallel import linear_regression_1d
+import torch
 
 
 class StandardDeviation(CustomFactor):
@@ -13,7 +15,7 @@ class StandardDeviation(CustomFactor):
     _min_win = 2
 
     def compute(self, data):
-        return data.std()
+        return data.nanstd()
 
 
 class RollingHigh(CustomFactor):
@@ -22,7 +24,7 @@ class RollingHigh(CustomFactor):
     _min_win = 2
 
     def compute(self, data):
-        return data.max()
+        return data.nanmax()
 
 
 class RollingLow(CustomFactor):
@@ -31,7 +33,20 @@ class RollingLow(CustomFactor):
     _min_win = 2
 
     def compute(self, data):
-        return data.min()
+        return data.nanmin()
+
+
+class RollingLinearRegression(CustomFactor):
+    _min_win = 2
+
+    def __init__(self, x, y, win):
+        super().__init__(win=win, inputs=[x, y])
+
+    def compute(self, x, y):
+        def lin_reg(x_, y_):
+            m, b = linear_regression_1d(x_, y_, dim=2)
+            return torch.cat([m.unsqueeze(-1), b.unsqueeze(-1)], dim=-1)
+        return x.agg(lin_reg, y)
 
 
 STDDEV = StandardDeviation

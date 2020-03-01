@@ -9,7 +9,9 @@ from .factor import BaseFactor, CustomFactor
 from .basic import MA, EMA
 from .statistical import STDDEV
 from .engine import OHLCV
+from ..parallel import nanmean
 import numpy as np
+import torch
 
 
 class NormalizedBollingerBands(CustomFactor):
@@ -29,6 +31,14 @@ class NormalizedBollingerBands(CustomFactor):
 
     def compute(self, closes, ma, std, k):
         return (closes - ma) / (k * std)
+
+
+class BollingerBands(NormalizedBollingerBands):
+    def compute(self, closes, ma, std, k):
+        d = k * std
+        up = ma + d
+        down = ma - d
+        return torch.cat([up.unsqueeze(-1), ma.unsqueeze(-1), down.unsqueeze(-1)], dim=-1)
 
 
 class MovingAverageConvergenceDivergenceSignal(EMA):
@@ -86,8 +96,8 @@ class RSI(CustomFactor):
             up = diff.clamp(min=0)
             down = diff.clamp(max=0)
             # Cutler's RSI, more stable, independent to data length
-            up = up[:, :, 1:].mean(dim=2)
-            down = down[:, :, 1:].mean(dim=2).abs()
+            up = nanmean(up[:, :, 1:], dim=2)
+            down = nanmean(down[:, :, 1:], dim=2).abs()
             if self.normalize:
                 return 1 - (2 / (1 + up / down))
             else:
@@ -105,8 +115,8 @@ class FastStochasticOscillator(CustomFactor):
     normalize = False
 
     def compute(self, highs, lows, closes):
-        highest_highs = highs.max()
-        lowest_lows = lows.min()
+        highest_highs = highs.nanmax()
+        lowest_lows = lows.nanmin()
         k = (closes.last() - lowest_lows) / (highest_highs - lowest_lows)
 
         if self.normalize:
@@ -119,4 +129,3 @@ BBANDS = NormalizedBollingerBands
 MACD = MovingAverageConvergenceDivergenceSignal
 TRANGE = TrueRange
 STOCHF = FastStochasticOscillator
-

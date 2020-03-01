@@ -1,10 +1,10 @@
 """
 @author: Heerozh (Zhang Jianhao)
-@copyright: Copyright 2019, Heerozh. All rights reserved.
+@copyright: Copyright 2019-2020, Heerozh. All rights reserved.
 @license: Apache 2.0
 @email: heeroz@gmail.com
 """
-from typing import Callable
+from typing import Callable, Tuple
 import torch
 import numpy as np
 
@@ -25,7 +25,7 @@ class ParallelGroupBy:
         # get inverse indices
         width = np.diff(boundary).max()
         groups = len(boundary) - 1
-        inverse_indices = sorted_indices.new_full((groups, width), n + 1).pin_memory()
+        inverse_indices = sorted_indices.new_full((groups, width), n + 1)
         for start, end, i in zip(boundary[:-1], boundary[1:], range(groups)):
             inverse_indices[i, 0:(end - start)] = sorted_indices[start:end]
         # keep inverse_indices in GPU for sort
@@ -54,8 +54,15 @@ class ParallelGroupBy:
 
     def revert(self, split_data: torch.Tensor, dbg_str='None') -> torch.Tensor:
         if tuple(split_data.shape) != self._data_shape:
-            raise ValueError('The return data shape{} of Factor `{}` must same as input{}'
-                             .format(tuple(split_data.shape), dbg_str, self._data_shape))
+            if tuple(split_data.shape[:2]) == self._data_shape[:2]:
+                raise ValueError('The downstream needs shape{2}, and the input factor "{1}" is '
+                                 'shape{0}. Look like this factor has multiple return values, '
+                                 'use slice to select a value before using it, for example: '
+                                 '`factor[0]`.'
+                                 .format(tuple(split_data.shape), dbg_str, self._data_shape))
+            else:
+                raise ValueError('The return data shape{} of Factor `{}` must same as input{}.'
+                                 .format(tuple(split_data.shape), dbg_str, self._data_shape))
         return torch.take(split_data, self._inverse_indices)
 
     def create(self, dtype, values, nan_fill=np.nan):
@@ -64,29 +71,48 @@ class ParallelGroupBy:
         return ret
 
 
-def nansum(data: torch.Tensor, dim=1) -> torch.Tensor:
+def _nansum(data: torch.Tensor, dim=1) -> Tuple[torch.Tensor, torch.Tensor]:
     data = data.clone()
     isnan = torch.isnan(data)
-    data[isnan] = 0
-    return data.sum(dim=dim)
+    data.masked_fill_(isnan, 0)  # much faster than data[isnan] = 0
+    return data.sum(dim=dim), isnan
+
+
+def nansum(data: torch.Tensor, dim=1) -> torch.Tensor:
+    return _nansum(data, dim)[0]
 
 
 def nanmean(data: torch.Tensor, dim=1) -> torch.Tensor:
+    total, isnan = _nansum(data, dim)
+    return total / (~isnan).sum(dim=dim)
+
+
+def nanvar(data: torch.Tensor, dim=1, ddof=0) -> torch.Tensor:
+    total, isnan = _nansum(data, dim)
+    n = (~isnan).sum(dim=dim)
+    mean = total / n
+    mean.unsqueeze_(-1)
+    var = (data - mean) ** 2 / (n.unsqueeze(-1) - ddof)
+    var.masked_fill_(isnan, 0)
+    return var.sum(dim=dim)
+
+
+def nanstd(data: torch.Tensor, dim=1, ddof=0) -> torch.Tensor:
+    return nanvar(data, dim, ddof).sqrt()
+
+
+def nanmax(data: torch.Tensor, dim=1) -> torch.Tensor:
     data = data.clone()
     isnan = torch.isnan(data)
-    data[isnan] = 0
-    return data.sum(dim=dim) / (~isnan).sum(dim=dim)
+    data.masked_fill_(isnan, -np.inf)
+    return data.max(dim=dim)[0]
 
 
-def nanstd(data: torch.Tensor, dim=1) -> torch.Tensor:
-    filled = data.clone()
+def nanmin(data: torch.Tensor, dim=1) -> torch.Tensor:
+    data = data.clone()
     isnan = torch.isnan(data)
-    filled[isnan] = 0
-    mean = filled.sum(dim=dim) / (~isnan).sum(dim=dim)
-    mean.unsqueeze_(-1)
-    var = (data - mean) ** 2 / (~isnan).sum(dim=dim).unsqueeze(-1)
-    var[isnan] = 0
-    return var.sum(dim=dim).sqrt()
+    data.masked_fill_(isnan, np.inf)
+    return data.min(dim=dim)[0]
 
 
 def nanlast(data: torch.Tensor, dim=1) -> torch.Tensor:
@@ -94,11 +120,48 @@ def nanlast(data: torch.Tensor, dim=1) -> torch.Tensor:
     w = torch.linspace(0.1, 0, mask.shape[-1], dtype=torch.float, device=mask.device)
     mask = mask.float() + w
     last = mask.argmin(dim=dim)
-    return data.gather(dim, last.unsqueeze(-1)).squeeze()
+    ret = data.gather(dim, last.unsqueeze(-1)).squeeze(-1)
+    return ret
+
+
+def pad_2d(data: torch.Tensor) -> torch.Tensor:
+    mask = torch.isnan(data)
+    idx = torch.arange(0, mask.shape[1], device=data.device).repeat(mask.shape[0], 1)
+    idx = idx.masked_fill(mask, 0)
+    idx = np.maximum.accumulate(idx.cpu(), axis=1)  # replace to idx.cummax when pytorch 1.5 release
+    idx = idx.to(device=data.device)
+    return torch.gather(data, 1, idx)
+
+
+def covariance(x, y, dim=1, ddof=0):
+    x_bar = nanmean(x, dim=dim).unsqueeze(-1)
+    y_bar = nanmean(y, dim=dim).unsqueeze(-1)
+    demean_x = x - x_bar
+    demean_y = y - y_bar
+    e, isnan = _nansum(demean_x * demean_y, dim=dim)
+    return e / ((~isnan).sum(dim=dim) - ddof)
+
+
+def pearsonr(x, y, dim=1):
+    cov = covariance(x, y, dim)
+    return cov / (nanstd(x) * nanstd(y))
+
+
+def linear_regression_1d(x, y, dim=1):
+    x_bar = nanmean(x, dim=dim).unsqueeze(-1)
+    y_bar = nanmean(y, dim=dim).unsqueeze(-1)
+    demean_x = x - x_bar
+    demean_y = y - y_bar
+    cov = nanmean(demean_x * demean_y, dim=dim)
+    x_var = nanvar(x, dim=dim, ddof=0)
+    slope = cov / x_var
+    slope[x_var == 0] = 0
+    intcp = y_bar.squeeze() - slope * x_bar.squeeze()
+    return slope, intcp
 
 
 class Rolling:
-    _split_multi = 64  # 32-64 recommended, you can tune this for kernel performance
+    _split_multi = 1  # 0.5-1 recommended, you can tune this for kernel performance
 
     @classmethod
     def unfold(cls, x, win, fill=np.nan):
@@ -111,10 +174,10 @@ class Rolling:
         self.win = win
 
         # rolling multiplication will consume lot of memory, split it by size
-        memory_usage = self.values.nelement() / (1024. ** 3)
+        memory_usage = self.values.nelement() * win / (1024. ** 3)
         memory_usage *= Rolling._split_multi
-        step = int(self.values.shape[0] / memory_usage)
-        boundary = list(range(0, self.values.shape[0], step)) + [self.values.shape[0]]
+        step = max(int(self.values.shape[1] / memory_usage), 1)
+        boundary = list(range(0, self.values.shape[1], step)) + [self.values.shape[1]]
         self.split = list(zip(boundary[:-1], boundary[1:]))
 
         if _adjustment is not None:
@@ -125,12 +188,12 @@ class Rolling:
             self.adjustments = None
             self.adjustment_last = None
 
-    def adjusted(self, s=None, e=None) -> torch.Tensor:
+    def adjust(self, s=None, e=None) -> torch.Tensor:
         """this will contiguous tensor consume lot of memory, limit e-s size"""
         if self.adjustments is not None:
-            return self.values[s:e] * self.adjustments[s:e] / self.adjustment_last[s:e]
+            return self.values[:, s:e] * self.adjustments[:, s:e] / self.adjustment_last[:, s:e]
         else:
-            return self.values[s:e]
+            return self.values[:, s:e]
 
     def __repr__(self):
         return 'spectre.parallel.Rolling object contains:\n' + self.values.__repr__()
@@ -141,8 +204,9 @@ class Rolling:
         and finally aggregate them into a whole.
         """
         assert all(r.win == self.win for r in others), '`others` must have same `win` with `self`'
-        seq = [op(self.adjusted(s, e), *[r.adjusted(s, e) for r in others]) for s, e in self.split]
-        return torch.cat(seq)
+        seq = [op(self.adjust(s, e), *[r.adjust(s, e) for r in others]).contiguous()
+               for s, e in self.split]
+        return torch.cat(seq, dim=1)
 
     def loc(self, i):
         if i == -1:
@@ -164,35 +228,38 @@ class Rolling:
         return self.loc(0)
 
     def sum(self, axis=2):
-        def _sum(x):
-            return x.sum(dim=axis)
+        return self.agg(lambda x: x.sum(dim=axis))
 
-        return self.agg(_sum)
+    def nansum(self, axis=2):
+        return self.agg(lambda x: nansum(x, dim=axis))
 
     def mean(self, axis=2):
-        def _mean(x):
-            # return nanmean(x, dim=axis)
-            # tensor.sum encounters nan will return nan anyway
-            return x.sum(dim=axis) / self.win
+        return self.agg(lambda x: x.sum(dim=axis) / self.win)
 
-        return self.agg(_mean)
+    def nanmean(self, axis=2):
+        return self.agg(lambda x: nanmean(x, dim=axis))
 
     def std(self, axis=2):
-        def _std(x):
-            # return nanstd(x, dim=axis)
-            # unbiased=False eq ddof=0
-            return x.std(unbiased=False, dim=axis)
+        # unbiased=False eq ddof=0
+        return self.agg(lambda x: x.std(unbiased=False, dim=axis))
 
-        return self.agg(_std)
+    def nanstd(self, axis=2):
+        return self.agg(lambda x: nanstd(x, dim=axis, ddof=0))
+
+    def var(self, axis=2):
+        return self.agg(lambda x: x.var(unbiased=False, dim=axis))
+
+    def nanvar(self, axis=2):
+        return self.agg(lambda x: nanvar(x, dim=axis, ddof=0))
 
     def max(self):
-        def _max(x):
-            return x.max(dim=2)[0]
-
-        return self.agg(_max)
+        return self.agg(lambda x: x.max(dim=2)[0])
 
     def min(self):
-        def _min(x):
-            return x.min(dim=2)[0]
+        return self.agg(lambda x: x.min(dim=2)[0])
 
-        return self.agg(_min)
+    def nanmax(self):
+        return self.agg(lambda x: nanmax(x, dim=2))
+
+    def nanmin(self):
+        return self.agg(lambda x: nanmin(x, dim=2))

@@ -72,7 +72,7 @@ class MyAlg(trading.CustomAlgorithm):
 
 # Back-test
 -----------------
-loader = spectre.factors.CsvDirLoader(...)
+loader = spectre.data.CsvDirLoader(...)
 blotter = spectre.trading.SimulationBlotter(loader)
 evt_mgr = spectre.trading.SimulationEventManager()
 alg = MyAlg(blotter, man=loader)
@@ -81,7 +81,7 @@ evt_mgr.subscribe(blotter)
 evt_mgr.run('2018-01-01', '2019-01-01')
 
 ## Or the helper function:
-spectre.run_backtest(loader, MyAlg, '2018-01-01', '2019-01-01')
+spectre.trading.run_backtest(loader, MyAlg, '2018-01-01', '2019-01-01')
 
 # Live
 ----------------
@@ -124,8 +124,18 @@ from .algorithm import (
     CustomAlgorithm,
     SimulationEventManager
 )
-from .blotter import (
+from .stopmodel import (
+    StopModel,
+    TrailingStopModel,
+    DecayTrailingStopModel,
+)
+from .position import (
+    Position,
+)
+from .portfolio import (
     Portfolio,
+)
+from .blotter import (
     BaseBlotter,
     SimulationBlotter
 )
@@ -133,12 +143,13 @@ from .metric import (
     drawdown,
     sharpe_ratio,
     turnover,
-    plot_cumulative_returns
+    annual_volatility,
 )
 
 
-def run_backtest(loader: 'DataLoader', alg_type: 'Type[CustomAlgorithm]', start, end):
-    # force python to free memory, else will encountering cuda out of memory
+def run_backtest(loader: 'DataLoader', alg_type: 'Type[CustomAlgorithm]', start, end,
+                 delay_factor=True):
+    # force python to free memory, else may be encountering cuda out of memory
     import gc
     gc.collect()
 
@@ -147,6 +158,6 @@ def run_backtest(loader: 'DataLoader', alg_type: 'Type[CustomAlgorithm]', start,
     alg = alg_type(_blotter, main=loader)
     evt_mgr.subscribe(_blotter)
     evt_mgr.subscribe(alg)
-    evt_mgr.run(start, end)
+    evt_mgr.run(start, end, delay_factor)
 
     return alg.results

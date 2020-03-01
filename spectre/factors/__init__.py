@@ -1,10 +1,3 @@
-from .dataloader import (
-    DataLoader,
-    ArrowLoader,
-    CsvDirLoader,
-    QuandlLoader,
-)
-
 from .engine import (
     FactorEngine,
     OHLCV,
@@ -13,14 +6,25 @@ from .engine import (
 from .factor import (
     BaseFactor,
     CustomFactor,
-    DataFactor,
-    AdjustedDataFactor,
     RankFactor,
     QuantileFactor,
 )
 
+from .datafactor import (
+    DataFactor,
+    AdjustedDataFactor,
+    AssetClassifierDataFactor,
+    DatetimeDataFactor,
+)
+
 from .filter import (
+    FilterFactor,
     StaticAssets,
+    OneHotEncoder,
+)
+
+from .multiprocessing import (
+    CPUParallelFactor
 )
 
 from .basic import (
@@ -35,7 +39,7 @@ from .basic import (
 )
 
 from .technical import (
-    NormalizedBollingerBands, BBANDS,
+    NormalizedBollingerBands, BBANDS, BollingerBands,
     MovingAverageConvergenceDivergenceSignal, MACD,
     TrueRange, TRANGE,
     RSI,
@@ -46,4 +50,13 @@ from .statistical import (
     StandardDeviation, STDDEV,
     RollingHigh, MAX,
     RollingLow, MIN,
+    RollingLinearRegression,
+)
+
+from .feature import (
+    MarketDispersion,
+    MarketReturn,
+    MarketVolatility,
+    MONTH, WEEKDAY, QUARTER,
+    IS_JANUARY, IS_DECEMBER, IS_MONTH_END, IS_MONTH_START, IS_QUARTER_END, IS_QUARTER_START,
 )

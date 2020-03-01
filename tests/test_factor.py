@@ -3,16 +3,24 @@ import spectre
 import os
 import numpy as np
 import pandas as pd
+import torch
 from numpy.testing import assert_almost_equal, assert_array_equal
 from os.path import dirname
 
 data_dir = dirname(__file__) + '/data/'
 
 
+class TestMultiProcessing(spectre.factors.CPUParallelFactor):
+
+    @staticmethod
+    def mp_compute(a, b) -> np.array:
+        return (a * b).mean(axis=0).values
+
+
 class TestFactorLib(unittest.TestCase):
 
     def test_factors(self):
-        loader = spectre.factors.CsvDirLoader(
+        loader = spectre.data.CsvDirLoader(
             data_dir + '/daily/', calender_asset='AAPL',
             ohlcv=('uOpen', 'uHigh', 'uLow', 'uClose', 'uVolume'),
             prices_index='date', parse_dates=True,
@@ -35,10 +43,13 @@ class TestFactorLib(unittest.TestCase):
         df_aapl_open = df.loc[(slice(None), 'AAPL'), 'open']
         df_msft_open = df.loc[(slice(None), 'MSFT'), 'open']
 
-        def test_expected(factor, _expected_aapl, _expected_msft, _len=8, decimal=7, delay=True):
+        def test_expected(factor, _expected_aapl, _expected_msft, _len=8, decimal=7,
+                          delay=True, check_bias=True):
             engine.remove_all_factors()
             engine.add(factor, 'test')
             _result = engine.run('2019-01-01', '2019-01-15', delay)
+            if check_bias:
+                engine.test_lookahead_bias('2019-01-01', '2019-01-15')
             result_aapl = _result.loc[(slice(None), 'AAPL'), 'test'].values
             result_msft = _result.loc[(slice(None), 'MSFT'), 'test'].values
             assert_almost_equal(result_aapl[-_len:], _expected_aapl[-_len:], decimal=decimal)
@@ -134,9 +145,12 @@ class TestFactorLib(unittest.TestCase):
 
         expected_aapl = [149, 149, 151.55, 156.03, 161, 153.69, 157, 156.94, np.nan]
         expected_msft = [104.39, 103.2, 105.22, 106, 103.2, 103.39, 108.85, np.nan]
-        # bcuz down is shift(-2) then shift(1)
+        # bcuz delay=True, so it is shift(-2) and then shift(1)
+        self.assertRaisesRegex(RuntimeError, '.*look-ahead bias.*', test_expected,
+                               spectre.factors.OHLCV.close.shift(-2), expected_aapl, expected_msft,
+                               total_rows)
         test_expected(spectre.factors.OHLCV.close.shift(-2),
-                      expected_aapl, expected_msft, total_rows)
+                      expected_aapl, expected_msft, total_rows, check_bias=False)
 
         # test zscore and shift, mask bug
         expected_aapl = [1.] * 10
@@ -181,7 +195,7 @@ class TestFactorLib(unittest.TestCase):
         test_expected(spectre.factors.EMA(11), expected_aapl, expected_msft, decimal=3)
         expected_aapl = talib.EMA(df_aapl_close.values, timeperiod=50)
         expected_msft = talib.EMA(df_msft_close.values, timeperiod=50)
-        test_expected(spectre.factors.EMA(50), expected_aapl, expected_msft, decimal=2)
+        test_expected(spectre.factors.EMA(50), expected_aapl, expected_msft, decimal=3)
 
         # test MACD
         expected = talib.MACD(df_aapl_close.values, fastperiod=12, slowperiod=26, signalperiod=9)
@@ -237,7 +251,81 @@ class TestFactorLib(unittest.TestCase):
                                      fastk_period=14)[0]
         test_expected(spectre.factors.STOCHF(), expected_aapl, expected_msft)
 
-        # test same factor only compute once, and nest factor window
+        # test MarketDispersion features
+        expected_aapl = [0.0006367, 0.047016, 0.0026646, 0.0056998, 0.0012298, 0.0110741,
+                         0., 0.0094943, 0.0098479]
+        expected_msft = expected_aapl.copy()
+        del expected_msft[6]
+        test_expected(spectre.factors.MarketDispersion(), expected_aapl, expected_msft, 10)
+
+        # test MarketReturn features
+        expected_aapl = [-0.030516, -0.0373418,  0.0232942, -0.0056998,  0.0183439,
+                         0.0184871,  0.0318528, -0.0359094,  0.011689]
+        expected_msft = expected_aapl.copy()
+        del expected_msft[6]
+        test_expected(spectre.factors.MarketReturn(), expected_aapl, expected_msft, 10)
+
+        # test MarketVolatility features
+        expected_aapl = [0.341934, 0.3439502, 0.344212, 0.3442616, 0.3447192, 0.3451061,
+                         0.3462575, 0.3471314, 0.3469935]
+        expected_msft = [0.341934, 0.3439502, 0.344212, 0.3442616, 0.3447192, 0.3451061,
+                         0.3467437, 0.3458821]
+        test_expected(spectre.factors.MarketVolatility(), expected_aapl, expected_msft, 10)
+
+        # test IS_JANUARY,DatetimeDataFactor,etc features
+        expected_aapl = [True] * 9
+        expected_msft = expected_aapl.copy()
+        del expected_msft[6]
+        test_expected(spectre.factors.IS_JANUARY, expected_aapl, expected_msft, 10)
+
+        expected_aapl = [False] * 9
+        expected_msft = expected_aapl.copy()
+        del expected_msft[6]
+        test_expected(spectre.factors.IS_DECEMBER, expected_aapl, expected_msft, 10)
+
+        expected_aapl = np.array([3., 4., 0., 1., 2., 3., 4., 0., 1.])
+        expected_msft = np.delete(expected_aapl, 5)  # 5 because DatetimeDataFactor no delay
+        test_expected(spectre.factors.WEEKDAY, expected_aapl, expected_msft, 10)
+
+        # test timezone
+        engine.timezone = 'America/New_York'
+        expected_aapl -= 1
+        expected_msft -= 1
+        expected_aapl[expected_aapl < 0] = 6
+        expected_msft[expected_msft < 0] = 6
+        test_expected(spectre.factors.WEEKDAY, expected_aapl, expected_msft, 10)
+        engine.timezone = 'UTC'
+
+        # test AssetClassifierDataFactor and one_hot features
+        test_sector = {'AAPL': 2, }
+        expected_aapl = [2] * 9
+        expected_msft = [-1] * 8
+        test_expected(spectre.factors.AssetClassifierDataFactor(test_sector, -1),
+                      expected_aapl, expected_msft, 10)
+
+        one_hot = spectre.factors.AssetClassifierDataFactor(test_sector, -1).one_hot()
+        expected_aapl = [True] * 9
+        expected_msft = [False] * 8
+        test_expected(one_hot[0], expected_aapl, expected_msft, 10)
+        expected_aapl = [False] * 9
+        expected_msft = [True] * 8
+        test_expected(one_hot[1], expected_aapl, expected_msft, 10)
+
+        # test ffill_na
+        mask = spectre.factors.WEEKDAY >= 3
+        factor = spectre.factors.WEEKDAY.filter(mask)
+        expected_aapl = np.array([3., 4., np.nan, np.nan, np.nan, 3., 4., np.nan, np.nan])
+        expected_msft = np.delete(expected_aapl, 5)
+        test_expected(factor, expected_aapl, expected_msft, 10)
+
+        expected_aapl = np.array([3., 4., 4, 4, 4, 3., 4., 4, 4])
+        expected_msft = np.delete(expected_aapl, 5)
+        engine.to_cuda()
+        test_expected(factor.fill_na(ffill=True), expected_aapl, expected_msft, 10)
+        engine.to_cpu()
+
+        # test reused factor only compute once, and nest factor window
+        engine.run('2019-01-11', '2019-01-15')  # let pre_compute_ test executable
         f1 = spectre.factors.BBANDS(win=20, inputs=[spectre.factors.OHLCV.close, 2])
         f2 = spectre.factors.EMA(win=10, inputs=[f1])
         fa = spectre.factors.STDDEV(win=15, inputs=[f2])
@@ -246,13 +334,29 @@ class TestFactorLib(unittest.TestCase):
         engine.add(f2, 'f2')
         engine.add(fa, 'fa')
         engine.add(fb, 'fb')
+
+        for f in engine._factors.values():
+            f.pre_compute_(engine, '2019-01-11', '2019-01-15')
+        self.assertEqual(4, f2._ref_count)
+
+        # reset _ref_count change caused by test above
+        def reset(_f):
+            _f._ref_count = 0
+            if _f.inputs:
+                for upstream in _f.inputs:
+                    if isinstance(upstream, spectre.factors.BaseFactor):
+                        reset(upstream)
+
+        for f in engine._factors.values():
+            reset(f)
+
         result = engine.run('2019-01-01', '2019-01-15')
-        self.assertEqual(f2._cache_hit, 3)
+        self.assertEqual(0, f2._ref_count)
 
         # test cuda result eq cup
 
     def test_filter_factor(self):
-        loader = spectre.factors.CsvDirLoader(
+        loader = spectre.data.CsvDirLoader(
             data_dir + 'daily/', ohlcv=('uOpen', 'uHigh', 'uLow', 'uClose', 'uVolume'),
             prices_index='date', parse_dates=True,
         )
@@ -269,7 +373,7 @@ class TestFactorLib(unittest.TestCase):
         # test ma5 with filter
         import talib
         total_rows = 10
-        loader = spectre.factors.CsvDirLoader(
+        loader = spectre.data.CsvDirLoader(
             data_dir + '/daily/', calender_asset='AAPL',
             ohlcv=('uOpen', 'uHigh', 'uLow', 'uClose', 'uVolume'),
             prices_index='date', parse_dates=True,
@@ -297,8 +401,15 @@ class TestFactorLib(unittest.TestCase):
         assert_almost_equal(result_aapl, expected_aapl)
         assert_almost_equal(result_msft, expected_msft)
 
+        aapl_filter = spectre.factors.StaticAssets(['AAPL'])
+        engine.remove_all_factors()
+        engine.set_filter(aapl_filter)
+        engine.add(spectre.factors.OHLCV.close, 'c')
+        df = engine.run('2018-01-01', '2019-01-15')
+        assert_array_equal(['AAPL'], df.index.get_level_values(1).unique())
+
     def test_cuda(self):
-        loader = spectre.factors.CsvDirLoader(
+        loader = spectre.data.CsvDirLoader(
             data_dir + '/daily/', ohlcv=('uOpen', 'uHigh', 'uLow', 'uClose', 'uVolume'),
             prices_index='date', parse_dates=True,
         )
@@ -374,8 +485,62 @@ class TestFactorLib(unittest.TestCase):
         expected = pd.qcut(data[1], 5, labels=False) + 1
         assert_array_equal(result[-1], expected)
 
+    def test_align_by_time(self):
+        loader = spectre.data.CsvDirLoader(
+            data_dir + '/daily/', calender_asset='AAPL',
+            ohlcv=('uOpen', 'uHigh', 'uLow', 'uClose', 'uVolume'),
+            prices_index='date', parse_dates=True,
+        )
+        engine = spectre.factors.FactorEngine(loader)
+        engine.set_align_by_time(True)
+        engine.add(spectre.factors.OHLCV.close, 'close')
+        engine.add(spectre.factors.SMA(2), 'ma')
+        df = engine.run("2019-01-01", "2019-01-15")
+
+        self.assertEqual(df.loc[("2019-01-11", 'MSFT'), 'ma'].values,
+                         df.loc[("2019-01-10", 'MSFT'), 'close'].values)
+
+        # dataloader
+        loader = spectre.data.CsvDirLoader(
+            data_dir + '/daily/', calender_asset='AAPL',
+            ohlcv=('uOpen', 'uHigh', 'uLow', 'uClose', 'uVolume'),
+            prices_index='date', parse_dates=True, align_by_time=True
+        )
+        engine = spectre.factors.FactorEngine(loader)
+        engine.set_align_by_time(False)
+        engine.add(spectre.factors.OHLCV.close, 'close')
+        engine.add(spectre.factors.SMA(2), 'ma')
+        df = engine.run("2019-01-01", "2019-01-15")
+
+        self.assertEqual(df.loc[("2019-01-11", 'MSFT'), 'ma'].values,
+                         df.loc[("2019-01-10", 'MSFT'), 'close'].values)
+
+    def test_linear_regression(self):
+        loader = spectre.data.CsvDirLoader(
+            data_dir + '/daily/', ohlcv=('uOpen', 'uHigh', 'uLow', 'uClose', 'uVolume'),
+            prices_index='date', parse_dates=True,
+        )
+        engine = spectre.factors.FactorEngine(loader)
+
+        class ARange(spectre.factors.CustomFactor):
+            def compute(self, y):
+                row = torch.arange(y.shape[-1], dtype=torch.float32, device=y.device)
+                return row.expand(y.shape)
+
+        x = ARange(inputs=[spectre.factors.OHLCV.close])
+        f = spectre.factors.RollingLinearRegression(x, spectre.factors.OHLCV.close, 10)
+        engine.add(f[0], 'slope')
+        engine.add(f[1], 'intcp')
+
+        df = engine.run("2019-01-01", "2019-01-15")
+        result = df.loc[(slice(None), 'AAPL'), 'slope']
+        assert_almost_equal(
+            [-0.555879, -0.710545, -0.935697, -1.04103, -1.232, -1.704182,
+             -0.873212, -0.640606,  0.046424], result, decimal=5)
+        assert_array_equal(['slope', 'intcp'], df.columns)
+
     def test_engine_cross_factor(self):
-        loader = spectre.factors.CsvDirLoader(
+        loader = spectre.data.CsvDirLoader(
             data_dir + '/daily/', ohlcv=('uOpen', 'uHigh', 'uLow', 'uClose', 'uVolume'),
             prices_index='date', parse_dates=True,
         )
@@ -393,28 +558,58 @@ class TestFactorLib(unittest.TestCase):
 
         assert_array_equal(result.f[result['mask']], result2.f)
 
+    def test_ref_count(self):
+        loader = spectre.data.CsvDirLoader(
+            data_dir + '/daily/', ohlcv=('uOpen', 'uHigh', 'uLow', 'uClose', 'uVolume'),
+            prices_index='date', parse_dates=True,
+        )
+        engine = spectre.factors.FactorEngine(loader)
+        t = spectre.factors.OHLCV.volume.top(1)
+        b = spectre.factors.OHLCV.volume.bottom(1)
+        engine.add(t, 't')
+        engine.add(t & b, 't&b')
+        engine.add(t | b, 't|b')
+        engine.add(~t, '~t')
+        engine.run("2019-01-01", "2019-01-05")
+
+        def test_count(k):
+            if isinstance(k, spectre.factors.CustomFactor):
+                if k._ref_count != 0:
+                    print(k, k._ref_count)
+                    raise ValueError("k._ref_count != 0")
+                if k._mask is not None:
+                    test_count(k._mask)
+
+            if k.inputs:
+                for upstream in k.inputs:
+                    if isinstance(upstream, spectre.factors.BaseFactor):
+                        test_count(upstream)
+
+        for _, k in engine._factors.items():
+            test_count(k)
+
     def test_ops(self):
-        loader = spectre.factors.CsvDirLoader(
+        loader = spectre.data.CsvDirLoader(
             data_dir + '/daily/', ohlcv=('uOpen', 'uHigh', 'uLow', 'uClose', 'uVolume'),
             prices_index='date', parse_dates=True,
         )
         engine = spectre.factors.FactorEngine(loader)
         f = spectre.factors.OHLCV.close
-        f2 = f**2
+        f2 = f ** 2
         engine.add(f, 'f')
         engine.add(f2, 'f^2')
         engine.add(-f, '-f')
-        engine.add(f+f2, 'f+f2')
-        engine.add(f-f2, 'f-f2')
-        engine.add(f*f2, 'f*f2')
-        engine.add(f/f2, 'f/f2')
+        engine.add(f + f2, 'f+f2')
+        engine.add(f - f2, 'f-f2')
+        engine.add(f * f2, 'f*f2')
+        engine.add(f / f2, 'f/f2')
 
-        engine.add(f>f2, 'f>f2')
-        engine.add(f<f2, 'f<f2')
-        engine.add(f>=f2, 'f>=f2')
-        engine.add(f<=f2, 'f<=f2')
-        engine.add(f==f2, 'f==f2')
-        engine.add(f!=f2, 'f!=f2')
+        engine.add(f > f2, 'f>f2')
+        engine.add(f < f2, 'f<f2')
+        engine.add(f >= f2, 'f>=f2')
+        engine.add(f <= f2, 'f<=f2')
+        engine.add(f == f2, 'f==f2')
+        engine.add(f != f2, 'f!=f2')
 
         t = spectre.factors.OHLCV.volume.top(1)
         b = spectre.factors.OHLCV.volume.bottom(1)
@@ -426,31 +621,91 @@ class TestFactorLib(unittest.TestCase):
         result = engine.run("2019-01-01", "2019-01-05")
 
         f = np.array([158.61, 101.30, 145.23, 102.28, 104.39])
-        f2 = f**2
+        f2 = f ** 2
         assert_array_equal(result['f^2'], f2)
         assert_array_equal(result['-f'], -f)
-        assert_array_equal(result['f+f2'], f+f2)
-        assert_array_equal(result['f-f2'], f-f2)
-        assert_array_equal(result['f*f2'], f*f2)
-        assert_array_equal(result['f/f2'], f/f2)
+        assert_array_equal(result['f+f2'], f + f2)
+        assert_array_equal(result['f-f2'], f - f2)
+        assert_array_equal(result['f*f2'], f * f2)
+        assert_array_equal(result['f/f2'], f / f2)
 
-        assert_array_equal(result['f>f2'], f>f2)
-        assert_array_equal(result['f<f2'], f<f2)
-        assert_array_equal(result['f>=f2'], f>=f2)
-        assert_array_equal(result['f<=f2'], f<=f2)
-        assert_array_equal(result['f==f2'], f==f2)
-        assert_array_equal(result['f!=f2'], f!=f2)
+        assert_array_equal(result['f>f2'], f > f2)
+        assert_array_equal(result['f<f2'], f < f2)
+        assert_array_equal(result['f>=f2'], f >= f2)
+        assert_array_equal(result['f<=f2'], f <= f2)
+        assert_array_equal(result['f==f2'], f == f2)
+        assert_array_equal(result['f!=f2'], f != f2)
 
         t = np.array([False, True, True, False, False])
         b = ~t
-        assert_array_equal(result['t&b'], t&b)
-        assert_array_equal(result['t|b'], t|b)
+        assert_array_equal(result['t&b'], t & b)
+        assert_array_equal(result['t|b'], t | b)
         assert_array_equal(result['~t'], b)
+
+    def test_multiprocess(self):
+        loader = spectre.data.CsvDirLoader(
+            data_dir + '/daily/', ohlcv=('uOpen', 'uHigh', 'uLow', 'uClose', 'uVolume'),
+            prices_index='date', parse_dates=True,
+        )
+        engine = spectre.factors.FactorEngine(loader)
+        engine.to_cuda()
+
+        self.assertRaises(ValueError, TestMultiProcessing,
+                          inputs=[spectre.factors.OHLCV.open])
+
+        engine.add(TestMultiProcessing(
+            win=10,
+            core=3,
+            inputs=[spectre.factors.AdjustedDataFactor(spectre.factors.OHLCV.open),
+                    spectre.factors.AdjustedDataFactor(spectre.factors.OHLCV.close)],
+            multiprocess=True
+        ), 'f')
+        engine.add(spectre.factors.MA(
+            win=10,
+            inputs=[spectre.factors.AdjustedDataFactor(spectre.factors.OHLCV.open) *
+                    spectre.factors.AdjustedDataFactor(spectre.factors.OHLCV.close)],
+        ), 'f2')
+        result = engine.run("2018-12-25", "2019-01-05")
+        assert_almost_equal(result.f.values, result.f2.values)
+        # test one row
+        engine.run("2019-01-04", "2019-01-05")
+
+        # test nested window
+        engine.clear()
+        engine.add(TestMultiProcessing(
+            win=10,
+            core=3,
+            inputs=[spectre.factors.MA(3), spectre.factors.MA(4)],
+            multiprocess=False
+        ), 'f')
+        engine.run("2019-01-04", "2019-01-05")
+
+    def test_memory_leak(self):
+        quandl_path = data_dir + '../../../historical_data/us/prices/quandl/'
+        loader = spectre.data.ArrowLoader(quandl_path + 'wiki_prices.feather')
+        engine = spectre.factors.FactorEngine(loader)
+
+        engine.to_cuda()
+        universe = spectre.factors.AverageDollarVolume(win=252).top(500)
+        engine.set_filter(universe)
+
+        df_prices = engine.get_price_matrix('2014-01-02', '2014-01-12')
+        loader = None
+        universe = None
+        df_prices = None
+        engine = None
+
+        import gc
+        import torch
+        gc.collect(2)
+        gc.collect(2)
+        torch.cuda.empty_cache()
+        self.assertEqual(0, torch.cuda.memory_allocated())
 
     @unittest.skipUnless(os.getenv('COVERAGE_RUNNING'), "too slow, run manually")
     def test_full_run(self):
         quandl_path = data_dir + '../../../historical_data/us/prices/quandl/'
-        loader = spectre.factors.ArrowLoader(quandl_path + 'wiki_prices.feather')
+        loader = spectre.data.ArrowLoader(quandl_path + 'wiki_prices.feather')
         engine = spectre.factors.FactorEngine(loader)
 
         engine.to_cuda()
@@ -496,5 +751,3 @@ class TestFactorLib(unittest.TestCase):
                             al_mean['10D'].values, decimal=3)
         assert_almost_equal(mean_return[('ma_cross', '10D', 'sem')].values,
                             al_std['10D'].values, decimal=3)
-
-

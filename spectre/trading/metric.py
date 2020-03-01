@@ -1,6 +1,6 @@
 """
 @author: Heerozh (Zhang Jianhao)
-@copyright: Copyright 2019, Heerozh. All rights reserved.
+@copyright: Copyright 2019-2020, Heerozh. All rights reserved.
 @license: Apache 2.0
 @email: heeroz@gmail.com
 """
@@ -24,60 +24,20 @@ def drawdown(cumulative_returns):
 
 
 def sharpe_ratio(daily_returns: pd.Series, annual_risk_free_rate):
-    risk_adj_ret = daily_returns - [annual_risk_free_rate/252] * len(daily_returns)
+    risk_adj_ret = daily_returns.sub(annual_risk_free_rate/252)
     annual_factor = np.sqrt(252)
     return annual_factor * risk_adj_ret.mean() / risk_adj_ret.std(ddof=1)
 
 
 def turnover(positions, transactions):
+    if transactions.shape[0] == 0:
+        return transactions.amount
     value_trades = (transactions.amount * transactions.fill_price).abs()
-    value_trades = value_trades.groupby(level=0).sum()
+    value_trades = value_trades.groupby(value_trades.index.normalize()).sum()
     return value_trades / positions.value.sum(axis=1)
 
 
-def plot_cumulative_returns(returns, positions, transactions, benchmark, annual_risk_free_rate):
-    import plotly.graph_objects as go
-    import plotly.subplots as subplots
-
-    fig = subplots.make_subplots(specs=[[{"secondary_y": True}]])
-
-    cum_ret = (returns + 1).cumprod()
-    fig.add_trace(go.Scatter(x=cum_ret.index, y=cum_ret.values * 100 - 100, name='portfolio',
-                             hovertemplate='<b>Date</b>:%{x}<br><b>Return</b>: %{y:.3f}%'))
-
-    if benchmark is not None:
-        cum_bench = (benchmark + 1).cumprod()
-        fig.add_trace(go.Scatter(x=cum_bench.index, y=cum_bench.values * 100 - 100,
-                                 name='benchmark', line=dict(width=0.5)))
-
-    fig.add_shape(go.layout.Shape(
-        type="rect", xref="x", yref="paper", opacity=0.5, line_width=0,
-        fillcolor="LightGoldenrodYellow", layer="below",
-        y0=0, y1=1, x0=cum_ret.idxmax(), x1=cum_ret[cum_ret.idxmax():].idxmin(),
-    ))
-
-    to = turnover(positions, transactions) * 100
-    resample = int(len(to) / 126)
-    if resample > 0:
-        to = to.fillna(0).rolling(resample).mean()[::resample]
-    fig.add_trace(go.Bar(x=to.index, y=to.values, opacity=0.2, name='turnover'),
-                  secondary_y=True)
-
-    sr = sharpe_ratio(returns, annual_risk_free_rate)
-    dd, ddd = drawdown(cum_ret)
-    mdd = abs(dd.min())
-    mdd_dur = ddd.max()
-
-    ann = go.layout.Annotation(
-        x=0.01, y=0.98, xref="paper", yref="paper",
-        showarrow=False, borderwidth=1, bordercolor='black', align='left',
-        text="<b>SharpeRatio:</b>     {:.3f}<br><b>MaxDrawDown:</b> {:.2f}%, {} Days".format(
-            sr, mdd * 100, mdd_dur
-        ),
-    )
-
-    fig.update_layout(height=400, annotations=[ann], margin={'t': 50})
-    fig.update_xaxes(tickformat='%Y-%m-%d')
-    fig.update_yaxes(title_text='cumulative return', ticksuffix='%', secondary_y=False)
-    fig.update_yaxes(title_text='turnover', ticksuffix='%', secondary_y=True)
-    fig.show()
+def annual_volatility(daily_returns: pd.Series):
+    volatility = daily_returns.std(ddof=1)
+    annual_factor = np.sqrt(252)
+    return annual_factor * volatility
