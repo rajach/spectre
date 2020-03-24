@@ -95,6 +95,19 @@ class TestParallelAlgorithm(unittest.TestCase):
         expected = [1.]
         assert_almost_equal(expected, result, decimal=6)
 
+        data = [1, 2, np.nan]
+        mask = [False, True, True]
+        result = spectre.parallel.masked_first(
+            torch.tensor(data, dtype=torch.float), torch.tensor(mask, dtype=torch.bool), dim=0)
+        expected = [2.]
+        assert_almost_equal(expected, result, decimal=6)
+
+        mask = [False, False, True]
+        result = spectre.parallel.masked_first(
+            torch.tensor(data, dtype=torch.float), torch.tensor(mask, dtype=torch.bool), dim=0)
+        expected = [np.nan]
+        assert_almost_equal(expected, result, decimal=6)
+
         # nanmin/max
         data = [[1, 2, -14, np.nan, 2], [99999, 8, 1, np.nan, 2]]
         result = spectre.parallel.nanmax(torch.tensor(data, dtype=torch.float))
@@ -125,6 +138,27 @@ class TestParallelAlgorithm(unittest.TestCase):
         for i in range(3):
             expected, _ = stats.pearsonr(x[i], y[i])
             assert_almost_equal(expected, result[i], decimal=6)
+
+        # test quantile
+        x = torch.tensor([[1, 2, np.nan, 3, 4, 5, 6], [3, 4, 5, 1.01, np.nan, 1.02, 1.03]])
+        result = spectre.parallel.quantile(x, 5, dim=1)
+        expected = pd.qcut(x[0], 5, labels=False)
+        assert_array_equal(expected, result[0])
+        expected = pd.qcut(x[1], 5, labels=False)
+        assert_array_equal(expected, result[1])
+
+        x = torch.tensor([[[1, 2, np.nan, 3, 4, 5, 6], [3, 4, 5, 1.01, np.nan, 1.02, 1.03]],
+                          [[1, 2, 2.1, 3, 4, 5, 6], [3, 4, 5, np.nan, np.nan, 1.02, 1.03]]
+                          ])
+        result = spectre.parallel.quantile(x, 5, dim=2)
+        expected = pd.qcut(x[0, 0], 5, labels=False)
+        assert_array_equal(expected, result[0, 0])
+        expected = pd.qcut(x[0, 1], 5, labels=False)
+        assert_array_equal(expected, result[0, 1])
+        expected = pd.qcut(x[1, 0], 5, labels=False)
+        assert_array_equal(expected, result[1, 0])
+        expected = pd.qcut(x[1, 1], 5, labels=False)
+        assert_array_equal(expected, result[1, 1])
 
     def test_pad2d(self):
         x = torch.tensor([[np.nan, 1, 1, np.nan, 1, np.nan, np.nan, 0, np.nan, 0, np.nan, np.nan, 0,

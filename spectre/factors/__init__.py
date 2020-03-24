@@ -7,7 +7,7 @@ from .factor import (
     BaseFactor,
     CustomFactor,
     RankFactor,
-    QuantileFactor,
+    QuantileClassifier,
 )
 
 from .datafactor import (
@@ -39,7 +39,7 @@ from .basic import (
 )
 
 from .technical import (
-    NormalizedBollingerBands, BBANDS, BollingerBands,
+    BollingerBands, BBANDS,
     MovingAverageConvergenceDivergenceSignal, MACD,
     TrueRange, TRANGE,
     RSI,
@@ -57,6 +57,7 @@ from .feature import (
     MarketDispersion,
     MarketReturn,
     MarketVolatility,
+    AssetData,
     MONTH, WEEKDAY, QUARTER,
     IS_JANUARY, IS_DECEMBER, IS_MONTH_END, IS_MONTH_START, IS_QUARTER_END, IS_QUARTER_START,
 )

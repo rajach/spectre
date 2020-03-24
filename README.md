@@ -101,7 +101,7 @@ universe = factors.AverageDollarVolume(win=120).top(100)
 engine.set_filter( universe )
 
 ma_cross = (factors.MA(5)-factors.MA(10)-factors.MA(30))
-bb_cross = -factors.BBANDS(win=5)
+bb_cross = -factors.BBANDS(win=5).normalized()
 bb_cross = bb_cross.filter(bb_cross < 0.7)  # p-hacking
 
 ma_cross_factor = ma_cross.rank(mask=universe).zscore()
@@ -164,7 +164,7 @@ class MyAlg(trading.CustomAlgorithm):
         engine.set_filter( universe )
 
         # add your factors
-        bb_cross = -factors.BBANDS(win=5)
+        bb_cross = -factors.BBANDS(win=5).normalized()
         bb_cross = bb_cross.filter(bb_cross < 0.7)  # p-hacking
         bb_cross_factor = bb_cross.rank(mask=universe).zscore()
         engine.add( bb_cross_factor.to_weight(), 'bb_weight' )
@@ -384,9 +384,9 @@ Set the Global Filter, engine deletes rows which Global Filter returns as False 
 affect all factors.
 
 
-### FactorEngine.set_align_by_time
+### FactorEngine.align_by_time
 
-`engine.set_align_by_time(True)`
+`engine.align_by_time = bool`
 
 Same as `CsvDirLoader(align_by_time=True)`, but it's dynamic. Notes: Very slow on large amounts of 
 data, and if the data source is already aligned, this method cannot make it return to unaligned. 
@@ -436,20 +436,35 @@ Set to `False` to force engine not delay any factors.
     
 Plotting common stock price chart for researching.
 
+`trace_types`: `dict(factor_name=plotly_trace_type)`, trace type can be 'Bar', or 'Scatter', 
+default is 'Scatter'.
+
+`styles`: `dict(factor_name=plotly_trace_styles)`, add the trace styles, please refer 
+to plotly documentation: [Scatter traces](https://plot.ly/python/reference/#scatter)
+
+
 ```python
+rsi = factors.RSI()
+buy_signal = (rsi.shift(1) < 30) & (rsi > 30)
+
 engine = factors.FactorEngine(loader)
 engine.timezone = 'America/New_York'
 engine.set_filter(factors.StaticAssets({'NVDA', 'MSFT'}))
 engine.add(factors.MA(20), 'MA20')
-engine.add(factors.RSI(), 'RSI')
+engine.add(rsi, 'RSI')
+engine.add(factors.OHLCV.close.filter(buy_signal), 'Buy')
 engine.to_cuda()
 engine.plot_chart('2017', '2018', styles={
     'MA20': {
               'line': {'dash': 'dash'}
-           },
+            },
     'RSI': {
-              'yaxis': 'y3',
+              'yaxis': 'y3',  # y1: price axis, y2: volume axis, yN: add new y-axis
               'line': {'width': 1}
+           },
+    'Buy': { 
+              'mode': 'markers', 
+              'marker': { 'symbol': 'triangle-up', 'size': 10, 'color': 'rgba(0, 0, 255, 0.5)' }
            }
 })
 ```
@@ -497,7 +512,7 @@ VWAP(inputs=[OHLCV.close, OHLCV.volume])
 ExponentialWeightedMovingAverage = EMA(win=5, inputs=[OHLCV.close])
 AverageDollarVolume(win=5, inputs=[OHLCV.close, OHLCV.volume])
 AnnualizedVolatility(win=20, inputs=[Returns(win=2), 252])
-NormalizedBollingerBands = BBANDS(win=20, inputs=[OHLCV.close, 2])
+BollingerBands = BBANDS(win=20, inputs=[OHLCV.close, 2])
 MovingAverageConvergenceDivergenceSignal = MACD(12, 26, 9, inputs=[OHLCV.close])
 TrueRange = TRANGE(inputs=[OHLCV.high, OHLCV.low, OHLCV.close])
 RSI(win=14, inputs=[OHLCV.close])
@@ -569,12 +584,13 @@ column may be inconsistent).
 Example of LogReturns:
 ```python
 from spectre import factors 
+import torch
 class LogReturns(factors.CustomFactor):
-    inputs = [factors.Returns(factors.OHLCV.close)]
+    inputs = [factors.Returns(2, inputs=[factors.OHLCV.close])]
     win = 1
 
     def compute(self, change: torch.Tensor) -> torch.Tensor:
-        return change.log()
+        return (change + 1).log()
 ```
 
 ### win > 1
@@ -893,7 +909,7 @@ Set stop tracking model for positions, models are:
 
 `trading.StopModel(ratio, callback)`\
 `trading.TrailingStopModel(ratio, callback)`\
-`trading.DecayTrailingStopModel(ratio, pnl_target, callback, decay_rate=0.05, max_decay=0)`
+`trading.PnLDecayTrailingStopModel` and `trading.TimeDecayTrailingStopModel`
 
 Stop loss example:
 ```python
@@ -911,13 +927,22 @@ class Backtester(trading.CustomAlgorithm):
         ...
 ```
 
-#### DecayTrailingStopModel
+#### PnLDecayTrailingStopModel
+`trading.PnLDecayTrailingStopModel(ratio, pnl_target, callback, decay_rate=0.05, max_decay=0)`
+
 This is a model that can stop gain and stop loss at the same time.
 
 Exponential decay to the stop ratio: `ratio * decay_rate ^ (PnL% / PnL_target%)`, 
-So `DecayTrailingStopModel(-0.1, 0.1, callback)` means initial stop loss is -10%, and the `ratio` 
-will decrease when profit% approaches the target +10%. If recorded high profit% exceeds 10%, any
-drawdown will trigger a stop loss.
+So `PnLDecayTrailingStopModel(-0.1, 0.1, callback)` means initial stop loss is -10%, and the 
+`ratio` will decrease when profit% approaches the target +10%. If recorded high profit% exceeds 10%, 
+any drawdown will trigger a stop loss.
+
+#### TimeDecayTrailingStopModel
+`trading.TimeDecayTrailingStopModel(ratio, period_target： pd.Timedelta, callback, decay_rate=0.05, 
+max_decay=0)`
+
+Same as `PnLDecayTrailingStopModel`, but target is time period.
+
 
 ### SimulationBlotter.portfolio Read Only Properties
 

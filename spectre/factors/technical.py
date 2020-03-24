@@ -14,13 +14,17 @@ import numpy as np
 import torch
 
 
-class NormalizedBollingerBands(CustomFactor):
+class BollingerBands(CustomFactor):
+    """ usage: BBANDS(win, inputs=[OHLCV.close, k]), k is constant normally 2 """
     inputs = (OHLCV.close, 2)
     win = 20
     _min_win = 2
 
     def __init__(self, win: Optional[int] = None, inputs: Optional[Sequence[BaseFactor]] = None):
         super().__init__(win, inputs)
+        if len(self.inputs) < 2:
+            raise ValueError("BollingerBands's inputs needs 2 inputs, "
+                             "inputs=[OHLCV.close, k]), k is constant normally 2.")
         comm_inputs = (self.inputs[0],)
         k = self.inputs[1]
         self.inputs = (self.inputs[0],
@@ -30,15 +34,18 @@ class NormalizedBollingerBands(CustomFactor):
         self.win = 1
 
     def compute(self, closes, ma, std, k):
-        return (closes - ma) / (k * std)
-
-
-class BollingerBands(NormalizedBollingerBands):
-    def compute(self, closes, ma, std, k):
         d = k * std
         up = ma + d
         down = ma - d
         return torch.cat([up.unsqueeze(-1), ma.unsqueeze(-1), down.unsqueeze(-1)], dim=-1)
+
+    def normalized(self):
+        return NormalizedBollingerBands(self.win, self.inputs)
+
+
+class NormalizedBollingerBands(CustomFactor):
+    def compute(self, closes, ma, std, k):
+        return (closes - ma) / (k * std)
 
 
 class MovingAverageConvergenceDivergenceSignal(EMA):
@@ -57,14 +64,14 @@ class MovingAverageConvergenceDivergenceSignal(EMA):
         self.inputs = (EMA(inputs=self.inputs, win=fast) - EMA(inputs=self.inputs, win=slow),)
 
     def normalized(self):
-        """In order not to double the calculation, reuse `inputs` factor here"""
+        # In order not to double the calculation, reuse `inputs` factor here
         macd = self.inputs[0]
         sign = self
         return macd - sign
 
 
 class TrueRange(CustomFactor):
-    """ATR = MA(inputs=(TrueRange(),))"""
+    """ATR = MA(14, inputs=(TrueRange(),))"""
     inputs = (OHLCV.high, OHLCV.low, OHLCV.close)
     win = 2
     _min_win = 2
@@ -78,10 +85,10 @@ class TrueRange(CustomFactor):
 
 
 class RSI(CustomFactor):
+    """ usage: RSI(win, inputs=[OHLCV.close]) """
     inputs = (OHLCV.close,)
     win = 14
     _min_win = 2
-    normalize = False
 
     def __init__(self, win: Optional[int] = None, inputs: Optional[Sequence[BaseFactor]] = None):
         super().__init__(win, inputs)
@@ -98,34 +105,34 @@ class RSI(CustomFactor):
             # Cutler's RSI, more stable, independent to data length
             up = nanmean(up[:, :, 1:], dim=2)
             down = nanmean(down[:, :, 1:], dim=2).abs()
-            if self.normalize:
-                return 1 - (2 / (1 + up / down))
-            else:
-                return 100 - (100 / (1 + up / down))
+            return 100 - (100 / (1 + up / down))
             # Wilder's RSI
             # up = up.ewm(com=14-1, adjust=False).mean()
             # down = down.ewm(com=14-1, adjust=False).mean().abs()
         return closes.agg(_rsi)
 
+    def normalized(self):
+        return self / 50 - 1
+
 
 class FastStochasticOscillator(CustomFactor):
+    """ usage: STOCHF(win, inputs=[OHLCV.high, OHLCV.low, OHLCV.close]) """
     inputs = (OHLCV.high, OHLCV.low, OHLCV.close)
     win = 14
     _min_win = 2
-    normalize = False
 
     def compute(self, highs, lows, closes):
         highest_highs = highs.nanmax()
         lowest_lows = lows.nanmin()
         k = (closes.last() - lowest_lows) / (highest_highs - lowest_lows)
 
-        if self.normalize:
-            return k - 0.5
-        else:
-            return k * 100
+        return k * 100
+
+    def normalized(self):
+        return self / 100 - 0.5
 
 
-BBANDS = NormalizedBollingerBands
+BBANDS = BollingerBands
 MACD = MovingAverageConvergenceDivergenceSignal
 TRANGE = TrueRange
 STOCHF = FastStochasticOscillator

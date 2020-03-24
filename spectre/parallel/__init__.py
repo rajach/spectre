@@ -5,6 +5,8 @@ from .algorithmic import (
     nanmean,
     nanvar,
     nanstd,
+    masked_last,
+    masked_first,
     nanlast,
     nanmax,
     nanmin,
@@ -12,4 +14,5 @@ from .algorithmic import (
     covariance,
     pearsonr,
     linear_regression_1d,
+    quantile,
 )

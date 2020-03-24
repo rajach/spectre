@@ -115,13 +115,26 @@ def nanmin(data: torch.Tensor, dim=1) -> torch.Tensor:
     return data.min(dim=dim)[0]
 
 
-def nanlast(data: torch.Tensor, dim=1) -> torch.Tensor:
-    mask = torch.isnan(data)
-    w = torch.linspace(0.1, 0, mask.shape[-1], dtype=torch.float, device=mask.device)
-    mask = mask.float() + w
-    last = mask.argmin(dim=dim)
+def masked_last(data: torch.Tensor, mask: torch.Tensor, dim=1, reverse=False) -> torch.Tensor:
+    if reverse:
+        w = torch.linspace(0.1, 0.0, mask.shape[-1], dtype=torch.float, device=mask.device)
+    else:
+        w = torch.linspace(0.0, 0.1, mask.shape[-1], dtype=torch.float, device=mask.device)
+    w = mask.float() + w
+    last = w.argmax(dim=dim)
     ret = data.gather(dim, last.unsqueeze(-1)).squeeze(-1)
+    ret_mask = mask.gather(dim, last.unsqueeze(-1)).squeeze(-1)
+    ret = torch.masked_fill(ret, ~ret_mask, np.nan)
     return ret
+
+
+def masked_first(data: torch.Tensor, mask: torch.Tensor, dim=1) -> torch.Tensor:
+    return masked_last(data, mask, dim, reverse=True)
+
+
+def nanlast(data: torch.Tensor, dim=1) -> torch.Tensor:
+    mask = ~torch.isnan(data)
+    return masked_last(data, mask, dim)
 
 
 def pad_2d(data: torch.Tensor) -> torch.Tensor:
@@ -158,6 +171,44 @@ def linear_regression_1d(x, y, dim=1):
     slope[x_var == 0] = 0
     intcp = y_bar.squeeze() - slope * x_bar.squeeze()
     return slope, intcp
+
+
+def quantile(data, bins, dim=1):
+    if data.dtype == torch.bool:
+        data = data.char()
+    if data.shape[1] == 1:  # if only one asset in universe
+        return data.new_full(data.shape, 0, dtype=torch.float32)
+
+    x, _ = torch.sort(data, dim=dim)
+    # get non-nan size of each row
+    mask = torch.isnan(data)
+    act_size = data.shape[dim] - mask.sum(dim=dim)
+    # get each bin's cut indices of each row by non-nan size
+    q = torch.linspace(0, 1, bins + 1, device=data.device)
+    q = q.view(-1, *[1 for _ in range(dim)])
+    q_index = q * (act_size - 1)
+    # calculate un-perfect cut weight
+    q_weight = q % 1
+    q_index = q_index.long()
+    q_next = q_index + 1
+    q_next[-1] = act_size - 1
+
+    # get quantile values of each row
+    dim_len = data.stride()[dim - 1]
+    offset = torch.arange(0, q_index[0].nelement(), device=data.device) * dim_len
+    offset = offset.reshape(q_index[0].shape)
+    q_index += offset
+    q_next += offset
+    b_start = x.take(q_index)
+    b_end = x.take(q_next)
+    b = b_start + (b_end - b_start) * q_weight
+    b[0] -= 1
+    b = b.unsqueeze(-1)
+
+    ret = data.new_full(data.shape, np.nan, dtype=torch.float32)
+    for start, end, tile in zip(b[:-1], b[1:], range(bins)):
+        ret[(data > start) & (data <= end)] = tile
+    return ret
 
 
 class Rolling:

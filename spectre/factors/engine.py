@@ -176,7 +176,12 @@ class FactorEngine:
     def create_tensor(self, group: str, dtype, values, nan_values) -> torch.Tensor:
         return self._groups[group].create(dtype, values, nan_values)
 
-    def set_align_by_time(self, enable: bool):
+    @property
+    def align_by_time(self):
+        return self._align_by_time
+
+    @align_by_time.setter
+    def align_by_time(self, enable: bool):
         """
         If `enable` is `True`, df index will be the product of 'date' and 'asset'.
         This method is slow, recommended to do it in your DataLoader in advance.
@@ -213,6 +218,13 @@ class FactorEngine:
         self.remove_all_factors()
         self.set_filter(None)
 
+    def empty_cache(self):
+        self._last_load = [None, None, None]
+        self._column_cache = {}
+        self._groups = dict()
+        self._dataframe = None
+        self._dataframe_index = None
+
     def remove_all_factors(self) -> None:
         self._factors = {}
 
@@ -222,12 +234,12 @@ class FactorEngine:
         However, this will lead to more VRAM usage and may affect performance.
         """
         self._device = torch.device('cuda')
-        self._last_load = [None, None, None]
         self._enable_stream = enable_stream
+        self.empty_cache()
 
     def to_cpu(self) -> None:
         self._device = torch.device('cpu')
-        self._last_load = [None, None, None]
+        self.empty_cache()
 
     def test_lookahead_bias(self, start, end):
         """Check all factors, if there are look-ahead bias"""
@@ -243,11 +255,15 @@ class FactorEngine:
         for col in self._loader.ohlcv:
             self._dataframe.loc[mid_right:, col] = np.random.randn(length)
         self._column_cache = {}
+        # hack to disable reload _dataframe
+        max_backwards = max([f.get_total_backwards_() for f in self._factors.values()])
+        if self._filter:
+            max_backwards = max(max_backwards, self._filter.get_total_backwards_())
+        self._last_load = [start, end, max_backwards]
         # check if results are consistent
         df = self.run(start, end)
         # clean
-        self._column_cache = {}
-        self._last_load = [None, None, None]
+        self.empty_cache()
 
         try:
             pd.testing.assert_frame_equal(df_expected[:mid_left], df[:mid_left])
@@ -371,7 +387,8 @@ class FactorEngine:
         ret = ret['price'].unstack(level=[1])
         return ret
 
-    def plot_chart(self, start, end, trace_types=None, styles=None, delay_factor=True):
+    def plot_chart(self, start, end, trace_types=None, styles=None, delay_factor=True,
+                   inline=True):
         """
         Plotting common stock price chart for researching.
         :param start: same as engine.run()
@@ -379,6 +396,7 @@ class FactorEngine:
         :param delay_factor: same as engine.run()
         :param trace_types: dict(factor_name=plotly_trace_type), default is 'Scatter'
         :param styles: dict(factor_name=plotly_trace_styles)
+        :param inline: display plot immediately
 
         Usage::
 
@@ -400,7 +418,9 @@ class FactorEngine:
 
         """
         df = self.run(start, end, delay_factor)
-        plot_chart(self._dataframe, self.loader_.ohlcv, df, trace_types=trace_types, styles=styles)
+        figs = plot_chart(self._dataframe, self.loader_.ohlcv, df, trace_types=trace_types,
+                          styles=styles, inline=inline)
+        return figs, df
 
     def full_run(self, start, end, trade_at='close', periods=(1, 4, 9),
                  quantiles=5, filter_zscore=20, demean=True, preview=True
@@ -453,7 +473,7 @@ class FactorEngine:
             mask = universe
             if filter_zscore is not None:
                 # Different: The zscore here contains all backward data which alphalens not counted.
-                zscore_factor = ret.zscore(axis_asset=True, mask=universe)
+                zscore_factor = ret.zscore(groupby='asset', mask=universe)
                 zscore_filter = zscore_factor.abs() <= filter_zscore
                 if mask is not None:
                     mask = mask & zscore_filter

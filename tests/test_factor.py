@@ -85,6 +85,13 @@ class TestFactorLib(unittest.TestCase):
                          0.235832738, 0.202266499, 0.308870901, 0.235088127]
         test_expected(spectre.factors.AnnualizedVolatility(3), expected_aapl, expected_msft, 10)
 
+        # test LogReturn
+        expected_aapl = np.log(df_aapl_close) - np.log(df_aapl_close.shift(1))
+        expected_msft = np.log(df_msft_close) - np.log(df_msft_close.shift(1))
+        expected_aapl = expected_aapl[-9:]
+        expected_msft = expected_msft[-8:]
+        test_expected(spectre.factors.LogReturns(), expected_aapl, expected_msft, 10)
+
         # test rank
         _expected_aapl = [2.] * 9
         _expected_aapl[6] = 1  # because msft was nan this day
@@ -162,10 +169,10 @@ class TestFactorLib(unittest.TestCase):
         test_expected(spectre.factors.OHLCV.open.zscore().shift(1),
                       expected_aapl, expected_msft, total_rows, delay=False)
 
-        # test quantile get factors from engine._factorsnan bug
-        expected_aapl = [5.] * 9
+        # test quantile get factors from engine._factors nan bug
+        expected_aapl = [4.] * 9
         expected_aapl[6] = np.nan
-        expected_msft = [1.] * 8
+        expected_msft = [0.] * 8
         engine.set_filter(spectre.factors.OHLCV.close.top(2))
         engine.add(spectre.factors.OHLCV.close.zscore(), 'pre')
         f = engine.get_factor('pre')
@@ -216,16 +223,23 @@ class TestFactorLib(unittest.TestCase):
                       decimal=3)
 
         # test BBANDS
-        expected = talib.BBANDS(df_aapl_close.values, timeperiod=20)
-        expected_aapl_normal = (df_aapl_close.values - expected[1]) / (expected[0] - expected[1])
-        expected = talib.BBANDS(df_msft_close.values, timeperiod=20)
-        expected_msft_normal = (df_msft_close.values - expected[1]) / (expected[0] - expected[1])
-        test_expected(spectre.factors.BBANDS(), expected_aapl_normal, expected_msft_normal)
+        expected_aapl = talib.BBANDS(df_aapl_close.values, timeperiod=20)
+        expected_msft = talib.BBANDS(df_msft_close.values, timeperiod=20)
+        test_expected(spectre.factors.BBANDS()[0], expected_aapl[0], expected_msft[0])
+        # normalized
+        expected_aapl_normal = (df_aapl_close.values - expected_aapl[1]) /\
+                               (expected_aapl[0] - expected_aapl[1])
+        expected_msft_normal = (df_msft_close.values - expected_msft[1]) / \
+                               (expected_msft[0] - expected_msft[1])
+        test_expected(spectre.factors.BBANDS().normalized(), expected_aapl_normal,
+                      expected_msft_normal)
+
         expected = talib.BBANDS(df_aapl_close.values, timeperiod=50, nbdevup=3, nbdevdn=3)
         expected_aapl_normal = (df_aapl_close.values - expected[1]) / (expected[0] - expected[1])
         expected = talib.BBANDS(df_msft_close.values, timeperiod=50, nbdevup=3, nbdevdn=3)
         expected_msft_normal = (df_msft_close.values - expected[1]) / (expected[0] - expected[1])
-        test_expected(spectre.factors.BBANDS(win=50, inputs=(spectre.factors.OHLCV.close, 3)),
+        test_expected(spectre.factors.BBANDS(win=50, inputs=(spectre.factors.OHLCV.close, 3))
+                      .normalized(),
                       expected_aapl_normal, expected_msft_normal)
 
         # test TRANGE
@@ -243,6 +257,10 @@ class TestFactorLib(unittest.TestCase):
                          47.095672, 46.7363662, 46.127465]
         # expected_aapl += 7
         test_expected(spectre.factors.RSI(), expected_aapl, expected_msft)
+        # normalized
+        expected_aapl = np.array(expected_aapl) / 50 - 1
+        expected_msft = np.array(expected_msft) / 50 - 1
+        test_expected(spectre.factors.RSI().normalized(), expected_aapl, expected_msft)
 
         # test stochf
         expected_aapl = talib.STOCHF(df_aapl_high.values, df_aapl_low.values, df_aapl_close.values,
@@ -271,6 +289,15 @@ class TestFactorLib(unittest.TestCase):
         expected_msft = [0.341934, 0.3439502, 0.344212, 0.3442616, 0.3447192, 0.3451061,
                          0.3467437, 0.3458821]
         test_expected(spectre.factors.MarketVolatility(), expected_aapl, expected_msft, 10)
+
+        # test AssetData features
+        expected_msft = df_msft_close[-8:].values
+        expected_aapl = df_msft_close[-8:].values
+        expected_aapl = np.insert(expected_aapl, 6, np.nan)
+        engine.align_by_time = True
+        test_expected(spectre.factors.AssetData('MSFT', spectre.factors.OHLCV.close),
+                      expected_aapl, expected_msft, 10)
+        engine.align_by_time = False
 
         # test IS_JANUARY,DatetimeDataFactor,etc features
         expected_aapl = [True] * 9
@@ -326,7 +353,7 @@ class TestFactorLib(unittest.TestCase):
 
         # test reused factor only compute once, and nest factor window
         engine.run('2019-01-11', '2019-01-15')  # let pre_compute_ test executable
-        f1 = spectre.factors.BBANDS(win=20, inputs=[spectre.factors.OHLCV.close, 2])
+        f1 = spectre.factors.BBANDS(win=20, inputs=[spectre.factors.OHLCV.close, 2]).normalized()
         f2 = spectre.factors.EMA(win=10, inputs=[f1])
         fa = spectre.factors.STDDEV(win=15, inputs=[f2])
         fb = spectre.factors.MACD(12, 26, 9, inputs=[f2])
@@ -442,17 +469,17 @@ class TestFactorLib(unittest.TestCase):
         assert_almost_equal(result, expected)
 
     def test_quantile(self):
-        f = spectre.factors.QuantileFactor()
+        f = spectre.factors.QuantileClassifier()
         f.bins = 5
         import torch
         result = f.compute(torch.tensor([[1, 1, np.nan, 1.01, 1.01, 2],
                                          [3, 4, 5, 1.01, np.nan, 1.01]]))
-        expected = [[1, 1, np.nan, 3, 3, 5], [3, 4, 5, 1, np.nan, 1]]
+        expected = [[0, 0, np.nan, 2, 2, 4], [2, 3, 4, 0, np.nan, 0]]
         assert_array_equal(result, expected)
 
         result = f.compute(torch.tensor([[-1, 1, np.nan, 1.01, 1.02, 2],
                                          [3, -4, 5, 1.01, np.nan, 1.01]]))
-        expected = [[1, 2, np.nan, 3, 4, 5], [4, 1, 5, 2, np.nan, 2]]
+        expected = [[0, 1, np.nan, 2, 3, 4], [3, 0, 4, 1, np.nan, 1]]
         assert_array_equal(result, expected)
 
         data = [[-1.01318216e+00, -6.03849769e-01, -1.57474554e+00, -1.72021079e+00,
@@ -482,7 +509,7 @@ class TestFactorLib(unittest.TestCase):
                  1.04137313e+00, -1.17894483e+00, -5.27170479e-01, -1.33455884e+00,
                  -1.50483203e+00, -1.50595963e+00, 1.53978884e+00, -2.41878211e-01]]
         result = f.compute(torch.tensor(data))
-        expected = pd.qcut(data[1], 5, labels=False) + 1
+        expected = pd.qcut(data[1], 5, labels=False)
         assert_array_equal(result[-1], expected)
 
     def test_align_by_time(self):
@@ -492,7 +519,7 @@ class TestFactorLib(unittest.TestCase):
             prices_index='date', parse_dates=True,
         )
         engine = spectre.factors.FactorEngine(loader)
-        engine.set_align_by_time(True)
+        engine.align_by_time = True
         engine.add(spectre.factors.OHLCV.close, 'close')
         engine.add(spectre.factors.SMA(2), 'ma')
         df = engine.run("2019-01-01", "2019-01-15")
@@ -507,7 +534,7 @@ class TestFactorLib(unittest.TestCase):
             prices_index='date', parse_dates=True, align_by_time=True
         )
         engine = spectre.factors.FactorEngine(loader)
-        engine.set_align_by_time(False)
+        engine.align_by_time = False
         engine.add(spectre.factors.OHLCV.close, 'close')
         engine.add(spectre.factors.SMA(2), 'ma')
         df = engine.run("2019-01-01", "2019-01-15")
