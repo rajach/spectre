@@ -43,6 +43,10 @@ class TestFactorLib(unittest.TestCase):
         df_aapl_open = df.loc[(slice(None), 'AAPL'), 'open']
         df_msft_open = df.loc[(slice(None), 'MSFT'), 'open']
 
+        # test raw data
+        raw_tensors = engine.run_raw('2018-01-01', '2019-01-15', False)
+        assert_almost_equal(df.open.values, raw_tensors['open'])
+
         def test_expected(factor, _expected_aapl, _expected_msft, _len=8, decimal=7,
                           delay=True, check_bias=True):
             engine.remove_all_factors()
@@ -351,10 +355,42 @@ class TestFactorLib(unittest.TestCase):
         test_expected(factor.fill_na(ffill=True), expected_aapl, expected_msft, 10)
         engine.to_cpu()
 
+        # test masked fill
+        factor = spectre.factors.WEEKDAY.masked_fill(mask, spectre.factors.WEEKDAY*2)
+        expected_aapl = np.array([6., 8., 0, 1, 2, 6., 8., 0, 1])
+        expected_msft = np.delete(expected_aapl, 5)
+        test_expected(factor, expected_aapl, expected_msft, 10)
+
+        factor = spectre.factors.WEEKDAY.masked_fill(mask, -1)
+        expected_aapl = np.array([-1., -1., 0, 1, 2, -1., -1., 0, 1])
+        expected_msft = np.delete(expected_aapl, 5)
+        test_expected(factor, expected_aapl, expected_msft, 10)
+
+        # test ForwardSignalData
+        signal = spectre.factors.OHLCV.close > 150
+        signal_price = spectre.factors.ForwardSignalData(4, spectre.factors.OHLCV.close, signal)
+        signal_ret = signal_price / spectre.factors.OHLCV.close - 1
+
+        expected_aapl = np.array([0, 0.04351718, 0.017114094, 0.017114094, 0, 0, 0, 0, 0])
+        expected_msft = np.array([np.nan, np.nan, np.nan, np.nan, np.nan, np.nan, np.nan, np.nan])
+        test_expected(signal_ret, expected_aapl, expected_msft, 10)
+
+        # test mad_clamp
+        factor = spectre.factors.WEEKDAY.mad_clamp(1)
+        expected_aapl = np.array([3., 3., 1, 1, 2, 3., 3., 1, 1])
+        expected_msft = np.delete(expected_aapl, 5)
+        test_expected(factor, expected_aapl, expected_msft, 10)
+
+        factor = spectre.factors.OHLCV.close.mad_clamp(2)
+        # pyTorch median does not take mean on odd array
+        expected_aapl = np.array([158.61, 147.07, 149., 149., 151.55, 156.03, 160.31, 153.69, 157.])
+        expected_msft = np.array([101.3, 102.28, 104.39, 103.2, 105.22, 105.61, 103.2, 103.39])
+        test_expected(factor, expected_aapl, expected_msft, 10, check_bias=False)
+
         # test reused factor only compute once, and nest factor window
         engine.run('2019-01-11', '2019-01-15')  # let pre_compute_ test executable
         f1 = spectre.factors.BBANDS(win=20, inputs=[spectre.factors.OHLCV.close, 2]).normalized()
-        f2 = spectre.factors.EMA(win=10, inputs=[f1])
+        f2 = spectre.factors.EMA(span=10, inputs=[f1])
         fa = spectre.factors.STDDEV(win=15, inputs=[f2])
         fb = spectre.factors.MACD(12, 26, 9, inputs=[f2])
         engine.remove_all_factors()
@@ -416,24 +452,30 @@ class TestFactorLib(unittest.TestCase):
         # get not filtered close value
         engine.remove_all_factors()
         engine.set_filter(None)
-        engine.add(spectre.factors.OHLCV.close, 'c')
+        engine.add(spectre.factors.OHLCV.close, 'close')
         df = engine.run('2018-01-01', '2019-01-15')
-        df_aapl_close = df.loc[(slice(None), 'AAPL'), 'c']
-        df_msft_close = df.loc[(slice(None), 'MSFT'), 'c']
+        df_aapl_close = df.loc[(slice(None), 'AAPL'), 'close']
+        df_msft_close = df.loc[(slice(None), 'MSFT'), 'close']
         expected_aapl = talib.SMA(df_aapl_close.values, timeperiod=5)[-total_rows:]
         expected_msft = talib.SMA(df_msft_close.values, timeperiod=5)[-total_rows:]
         expected_aapl = np.delete(expected_aapl, [0, 1, 8])
         expected_msft = [expected_msft[2], expected_msft[8]]
-        # test
         assert_almost_equal(result_aapl, expected_aapl)
         assert_almost_equal(result_msft, expected_msft)
 
+        # test StaticAssets
         aapl_filter = spectre.factors.StaticAssets(['AAPL'])
         engine.remove_all_factors()
         engine.set_filter(aapl_filter)
-        engine.add(spectre.factors.OHLCV.close, 'c')
+        engine.add(spectre.factors.OHLCV.close, 'close')
         df = engine.run('2018-01-01', '2019-01-15')
         assert_array_equal(['AAPL'], df.index.get_level_values(1).unique())
+
+        # test filtering a filter
+        engine.remove_all_factors()
+        mask = spectre.factors.OHLCV.close > 177
+        self.assertRaisesRegex(ValueError, '.*does not support local filtering.*',
+                               mask.filter, mask)
 
     def test_cuda(self):
         loader = spectre.data.CsvDirLoader(
@@ -512,6 +554,15 @@ class TestFactorLib(unittest.TestCase):
         expected = pd.qcut(data[1], 5, labels=False)
         assert_array_equal(result[-1], expected)
 
+        data = spectre.parallel.Rolling(torch.tensor(data)[:, :3], 3)
+        f = spectre.factors.RollingQuantile(10)
+        result = f.compute(data, 5)
+        expected = [
+            np.nan,
+            pd.qcut(data.values[0, 1], 5, labels=False)[-1],
+            pd.qcut(data.values[0, 2], 5, labels=False)[-1]]
+        assert_array_equal(result[0], expected)
+
     def test_align_by_time(self):
         loader = spectre.data.CsvDirLoader(
             data_dir + '/daily/', calender_asset='AAPL',
@@ -549,15 +600,9 @@ class TestFactorLib(unittest.TestCase):
         )
         engine = spectre.factors.FactorEngine(loader)
 
-        class ARange(spectre.factors.CustomFactor):
-            def compute(self, y):
-                row = torch.arange(y.shape[-1], dtype=torch.float32, device=y.device)
-                return row.expand(y.shape)
-
-        x = ARange(inputs=[spectre.factors.OHLCV.close])
-        f = spectre.factors.RollingLinearRegression(x, spectre.factors.OHLCV.close, 10)
-        engine.add(f[0], 'slope')
-        engine.add(f[1], 'intcp')
+        f = spectre.factors.RollingLinearRegression(10, None, spectre.factors.OHLCV.close)
+        engine.add(f.coef, 'slope')
+        engine.add(f.intercept, 'intcp')
 
         df = engine.run("2019-01-01", "2019-01-15")
         result = df.loc[(slice(None), 'AAPL'), 'slope']
@@ -565,6 +610,27 @@ class TestFactorLib(unittest.TestCase):
             [-0.555879, -0.710545, -0.935697, -1.04103, -1.232, -1.704182,
              -0.873212, -0.640606,  0.046424], result, decimal=5)
         assert_array_equal(['slope', 'intcp'], df.columns)
+
+        # test RollingMomentum
+        engine.remove_all_factors()
+        f = spectre.factors.RollingMomentum(5)
+        engine.add(f.gain, 'gain')
+        engine.add(f.accelerate, 'accelerate')
+        engine.add(f.intercept, 'intcp')
+        engine.add(spectre.factors.OHLCV.close, 'close')
+
+        df = engine.run("2019-01-01", "2019-01-15")
+        result = df.xs('AAPL', level=1)
+
+        from sklearn.linear_model import LinearRegression
+        x = np.stack([np.arange(5), np.arange(5) ** 2]).T
+        reg = LinearRegression().fit(x, result.close[-5:])
+        assert_almost_equal(reg.coef_, result[['gain', 'accelerate']].iloc[-1])
+        self.assertAlmostEqual(reg.intercept_, result.intcp.iloc[-1])
+
+        reg = LinearRegression().fit(x, result.close[-6:-1])
+        assert_almost_equal(reg.coef_, result[['gain', 'accelerate']].iloc[-2])
+        self.assertAlmostEqual(reg.intercept_, result.intcp.iloc[-2])
 
     def test_engine_cross_factor(self):
         loader = spectre.data.CsvDirLoader(
@@ -683,14 +749,14 @@ class TestFactorLib(unittest.TestCase):
         engine.add(TestMultiProcessing(
             win=10,
             core=3,
-            inputs=[spectre.factors.AdjustedDataFactor(spectre.factors.OHLCV.open),
-                    spectre.factors.AdjustedDataFactor(spectre.factors.OHLCV.close)],
+            inputs=[spectre.factors.AdjustedColumnDataFactor(spectre.factors.OHLCV.open),
+                    spectre.factors.AdjustedColumnDataFactor(spectre.factors.OHLCV.close)],
             multiprocess=True
         ), 'f')
         engine.add(spectre.factors.MA(
             win=10,
-            inputs=[spectre.factors.AdjustedDataFactor(spectre.factors.OHLCV.open) *
-                    spectre.factors.AdjustedDataFactor(spectre.factors.OHLCV.close)],
+            inputs=[spectre.factors.AdjustedColumnDataFactor(spectre.factors.OHLCV.open) *
+                    spectre.factors.AdjustedColumnDataFactor(spectre.factors.OHLCV.close)],
         ), 'f2')
         result = engine.run("2018-12-25", "2019-01-05")
         assert_almost_equal(result.f.values, result.f2.values)

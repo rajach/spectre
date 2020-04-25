@@ -101,6 +101,22 @@ class CustomAlgorithm(EventReceiver, ABC):
         return self._current_dt
 
     @property
+    def long_only(self):
+        raise NotImplementedError('Please using self.blotter.long_only')
+
+    @long_only.setter
+    def long_only(self, b):
+        raise NotImplementedError('Please using self.blotter.long_only')
+
+    @property
+    def daily_curb(self):
+        raise NotImplementedError('Please using self.blotter.daily_curb')
+
+    @daily_curb.setter
+    def daily_curb(self, b):
+        raise NotImplementedError('Please using self.blotter.daily_curb')
+
+    @property
     def results(self):
         return self._results
 
@@ -284,6 +300,10 @@ class SimulationEventManager(EventManager):
             gc.collect()
             torch.cuda.empty_cache()
 
+        # infer freq
+        delta = min(ticks[1:] - ticks[:-1])
+        data_freq = delta.resolution_string
+
         # loop factor data
         last_day = None
         for dt in tqdm(ticks):
@@ -299,7 +319,7 @@ class SimulationEventManager(EventManager):
             alg.set_datetime(dt)
 
             # fire daily data event
-            if dt.hour == 0:
+            if data_freq == 'D':
                 self.fire_event(self, EveryBarData)
 
             # fire open event
@@ -308,7 +328,7 @@ class SimulationEventManager(EventManager):
                 last_day = dt.day
 
             # fire intraday data event
-            if dt.hour != 0:
+            if data_freq != 'D':
                 alg.blotter.set_price('close')
                 self.fire_event(self, EveryBarData)
 

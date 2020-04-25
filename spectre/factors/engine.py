@@ -4,11 +4,11 @@
 @license: Apache 2.0
 @email: heeroz@gmail.com
 """
-from typing import Union, Iterable, Tuple
+from typing import Union, Iterable, Tuple, Dict
 import warnings
 from .factor import BaseFactor
 from .filter import FilterFactor, StaticAssets
-from .datafactor import DataFactor, AdjustedDataFactor
+from .datafactor import ColumnDataFactor, AdjustedColumnDataFactor
 from ..plotting import plot_quantile_and_cumulative_returns, plot_chart
 from ..data import DataLoader
 from ..parallel import ParallelGroupBy
@@ -18,11 +18,11 @@ import torch
 
 
 class OHLCV:
-    open = DataFactor(inputs=('',), should_delay=False)
-    high = DataFactor(inputs=('',))
-    low = DataFactor(inputs=('',))
-    close = DataFactor(inputs=('',))
-    volume = DataFactor(inputs=('',))
+    open = ColumnDataFactor(inputs=('',), should_delay=False)
+    high = ColumnDataFactor(inputs=('',))
+    low = ColumnDataFactor(inputs=('',))
+    close = ColumnDataFactor(inputs=('',))
+    volume = ColumnDataFactor(inputs=('',))
 
 
 class FactorEngine:
@@ -191,7 +191,7 @@ class FactorEngine:
     def add(self,
             factor: Union[Iterable[BaseFactor], BaseFactor],
             name: Union[Iterable[str], str],
-            ) -> None:
+            replace=False) -> None:
         """
         Add factor or filter to engine, as a column.
         """
@@ -199,7 +199,7 @@ class FactorEngine:
             for i, fct in enumerate(factor):
                 self.add(fct, name and name[i] or None)
         else:
-            if name in self._factors:
+            if name in self._factors and not replace:
                 raise KeyError('A factor with the name {} already exists.'
                                'please specify a new name by engine.add(factor, new_name)'
                                .format(name))
@@ -213,6 +213,10 @@ class FactorEngine:
 
     def get_factor(self, name):
         return self._factors[name]
+
+    @property
+    def factors(self):
+        return self._factors.copy()
 
     def clear(self):
         self.remove_all_factors()
@@ -271,11 +275,7 @@ class FactorEngine:
             raise RuntimeError('A look-ahead bias was detected, please check your factors code')
         return 'No assertion raised.'
 
-    def run(self, start: Union[str, pd.Timestamp], end: Union[str, pd.Timestamp],
-            delay_factor=True) -> pd.DataFrame:
-        """
-        Compute factors and filters, return a df contains all.
-        """
+    def _run(self, start, end, delay_factor):
         if len(self._factors) == 0:
             raise ValueError('Please add at least one factor to engine, then run again.')
 
@@ -287,7 +287,6 @@ class FactorEngine:
                           RuntimeWarning)
             delays = {}
 
-        start, end = pd.to_datetime(start, utc=True), pd.to_datetime(end, utc=True)
         # make columns to data factors.
         if self._loader.ohlcv is not None:
             OHLCV.open.inputs = (self._loader.ohlcv[0], self._loader.adjustment_multipliers[0])
@@ -328,11 +327,6 @@ class FactorEngine:
         shifted_mask = None
         if filter_:
             shifted_mask = self._compute_and_revert(filter_, 'filter')
-        # do cpu work and synchronize will automatically done by torch
-        ret = pd.DataFrame(index=self._dataframe.index.copy())
-        ret = ret.assign(**{col: t.cpu().numpy() for col, t in results.items()})
-        if filter_:
-            ret = ret[shifted_mask.cpu().numpy()]
 
         # do clean up again
         if filter_:
@@ -340,12 +334,52 @@ class FactorEngine:
         for f in factors.values():
             f.clean_up_()
 
+        return results, shifted_mask, len(delays) > 0
+
+    def run(self, start: Union[str, pd.Timestamp], end: Union[str, pd.Timestamp],
+            delay_factor=True) -> pd.DataFrame:
+        """
+        Compute factors and filters, return a df contains all.
+        """
+        start, end = pd.to_datetime(start, utc=True), pd.to_datetime(end, utc=True)
+
+        results, shifted_mask, delayed = self._run(start, end, delay_factor)
+        # do cpu work and synchronize will automatically done by torch
+        ret = pd.DataFrame(index=self._dataframe.index.copy())
+        ret = ret.assign(**{col: t.cpu().numpy() for col, t in results.items()})
+        if shifted_mask is not None:
+            ret = ret[shifted_mask.cpu().numpy()]
+
         # if any factors delayed, return df also should be delayed
-        if delays:
+        if delayed:
             index = ret.index.levels[0]
             start_ind = index.get_loc(start, 'bfill')
+            if (start_ind + 1) >= len(index):
+                raise ValueError('There is no data between start and end.')
             start = index[start_ind + 1]
         return ret.loc[start:]
+
+    def run_raw(self, start: Union[str, pd.Timestamp], end: Union[str, pd.Timestamp],
+                delay_factor=True) -> Dict[str, torch.Tensor]:
+        """
+        Compute factors and filters, return a dict contains factor_name = torch.Tensor
+        """
+        start, end = pd.to_datetime(start, utc=True), pd.to_datetime(end, utc=True)
+
+        results, shifted_mask, delayed = self._run(start, end, delay_factor)
+
+        index = self._dataframe.index.levels[0]
+        start_ind = index.get_loc(start, 'bfill')
+        if delayed:  # if any factors delayed, return df also should be delayed
+            start_ind += 1
+        if start_ind >= len(index):
+            raise ValueError('There is no data between start and end.')
+        if shifted_mask is not None:
+            shifted_mask = shifted_mask[start_ind:]
+            results = {k: v[start_ind:][shifted_mask] for k, v in results.items()}
+        else:
+            results = {k: v[start_ind:] for k, v in results.items()}
+        return results
 
     def get_factors_raw_value(self):
         stream = None
@@ -356,7 +390,7 @@ class FactorEngine:
     def get_price_matrix(self,
                          start: Union[str, pd.Timestamp],
                          end: Union[str, pd.Timestamp],
-                         prices: DataFactor = OHLCV.close,
+                         prices: ColumnDataFactor = OHLCV.close,
                          ) -> pd.DataFrame:
         """
         Get the price data for Factor Return Analysis.
@@ -366,7 +400,7 @@ class FactorEngine:
                        to OHLCV.open.
         """
         factors_backup = self._factors
-        self._factors = {'price': AdjustedDataFactor(prices)}
+        self._factors = {'price': AdjustedColumnDataFactor(prices)}
 
         # get tickers first
         assets = None
@@ -459,11 +493,11 @@ class FactorEngine:
             column_names[c + '_q_'] = (c, 'factor_quantile')
             column_names[c + '_w_'] = (c, 'factor_weight')
 
-        # add the rolling returns of each period, use AdjustedDataFactor for best performance
+        # add the rolling returns of each period, use AdjustedColumnDataFactor for best performance
         shift = -1
-        inputs = (AdjustedDataFactor(OHLCV.close),)
+        inputs = (AdjustedColumnDataFactor(OHLCV.close),)
         if trade_at == 'open':
-            inputs = (AdjustedDataFactor(OHLCV.open),)
+            inputs = (AdjustedColumnDataFactor(OHLCV.open),)
         elif trade_at == 'current_close':
             shift = 0
         from .basic import Returns

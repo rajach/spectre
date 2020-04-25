@@ -6,13 +6,14 @@ from .engine import (
 from .factor import (
     BaseFactor,
     CustomFactor,
+    CrossSectionFactor,
     RankFactor,
     QuantileClassifier,
 )
 
 from .datafactor import (
-    DataFactor,
-    AdjustedDataFactor,
+    ColumnDataFactor,
+    AdjustedColumnDataFactor,
     AssetClassifierDataFactor,
     DatetimeDataFactor,
 )
@@ -36,6 +37,7 @@ from .basic import (
     ExponentialWeightedMovingAverage, EMA,
     AverageDollarVolume,
     AnnualizedVolatility,
+    ElementWiseMax, ElementWiseMin,
 )
 
 from .technical import (
@@ -51,13 +53,25 @@ from .statistical import (
     RollingHigh, MAX,
     RollingLow, MIN,
     RollingLinearRegression,
+    RollingMomentum,
+    RollingQuantile,
+    HalfLifeMeanReversion,
+    RollingCorrelation,
+    InformationCoefficient,
+    CrossSectionR2,
 )
 
 from .feature import (
     MarketDispersion,
     MarketReturn,
     MarketVolatility,
+    AdvanceDeclineRatio,
     AssetData,
-    MONTH, WEEKDAY, QUARTER,
+    MONTH, WEEKDAY, QUARTER, TIME,
     IS_JANUARY, IS_DECEMBER, IS_MONTH_END, IS_MONTH_START, IS_QUARTER_END, IS_QUARTER_START,
+)
+
+from .label import (
+    RollingFirst,
+    ForwardSignalData,
 )

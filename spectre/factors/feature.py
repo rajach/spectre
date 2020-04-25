@@ -6,15 +6,15 @@
 """
 import warnings
 from .datafactor import DatetimeDataFactor
-from .factor import TimeGroupFactor, CustomFactor
+from .factor import CrossSectionFactor, CustomFactor
 from .basic import Returns
-from ..parallel import nanstd, nanmean
+from ..parallel import nanstd, nanmean, nansum
 
 
 # ----------- Common Market Features -----------
 
 
-class MarketDispersion(TimeGroupFactor):
+class MarketDispersion(CrossSectionFactor):
     """Cross-section standard deviation of universe stocks returns."""
     inputs = (Returns(), )
     win = 1
@@ -24,7 +24,7 @@ class MarketDispersion(TimeGroupFactor):
         return ret.repeat(1, returns.shape[1])
 
 
-class MarketReturn(TimeGroupFactor):
+class MarketReturn(CrossSectionFactor):
     """Cross-section mean returns of universe stocks."""
     inputs = (Returns(), )
     win = 1
@@ -42,6 +42,18 @@ class MarketVolatility(CustomFactor):
 
     def compute(self, returns, annualization_factor):
         return (returns.nanvar() * annualization_factor) ** 0.5
+
+
+class AdvanceDeclineRatio(CrossSectionFactor):
+    """Need to work with MA, and could be applied to volume too"""
+    inputs = (Returns(), )
+    win = 1
+
+    def compute(self, returns):
+        advancing = nansum(returns > 0, dim=1)
+        declining = nansum(returns < 0, dim=1)
+        ratio = (advancing / declining).unsqueeze(-1)
+        return ratio.repeat(1, returns.shape[1])
 
 
 # ----------- Asset-specific data -----------
@@ -72,6 +84,7 @@ class AssetData(CustomFactor):
 MONTH = DatetimeDataFactor('month')
 WEEKDAY = DatetimeDataFactor('weekday')
 QUARTER = DatetimeDataFactor('quarter')
+TIME = DatetimeDataFactor('hour') + DatetimeDataFactor('minute') / 60.0
 
 IS_JANUARY = MONTH == 1
 IS_DECEMBER = MONTH == 12

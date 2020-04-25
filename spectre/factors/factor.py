@@ -120,19 +120,25 @@ class BaseFactor:
     # --------------- helper functions ---------------
 
     def top(self, n, mask: 'BaseFactor' = None):
+        """Cross-section top values"""
         return self.rank(ascending=False, mask=mask) <= n
 
     def bottom(self, n, mask: 'BaseFactor' = None):
         return self.rank(ascending=True, mask=mask) <= n
 
     def rank(self, ascending=True, mask: 'BaseFactor' = None):
+        """Cross-section rank"""
         factor = RankFactor(inputs=(self,), mask=mask)
         # factor.method = method
         factor.ascending = ascending
         return factor
 
-    def zscore(self, groupby: str = 'date', mask: 'BaseFactor' = None):
-        factor = ZScoreFactor(inputs=(self,))
+    def zscore(self, groupby: str = 'date', mask: 'BaseFactor' = None, weight: 'BaseFactor' = None):
+        """Cross-section zscore"""
+        inputs = [self]
+        if weight is not None:
+            inputs.append(weight)
+        factor = ZScoreFactor(inputs=inputs)
         factor.set_mask(mask)
         factor.groupby = groupby
 
@@ -140,10 +146,10 @@ class BaseFactor:
 
     def demean(self, groupby: Union[str, dict] = None, mask: 'BaseFactor' = None):
         """
+        Cross-section demean.
         Set `groupby` to the name of a column, like 'sector'.
-        `groupby` also can be a dictionary like groupby={'name': group_id}, `group_id` must > 0
-        dict groupby will interrupt the parallelism of cuda, it is recommended to add group key to
-        the Dataloader as a column, or use it only in the last step.
+        `groupby` also can be a dictionary like groupby={'name': group_id}, `group_id` must > 0.
+        Group by dict is implemented by pandas, not in GPU.
         """
         factor = DemeanFactor(inputs=(self,), mask=mask)
         if isinstance(groupby, str):
@@ -155,6 +161,7 @@ class BaseFactor:
         return factor
 
     def quantile(self, bins=5, mask: 'BaseFactor' = None, groupby: str = 'date'):
+        """Cross-section quantiles to which the factor belongs"""
         factor = QuantileClassifier(inputs=(self,))
         factor.set_mask(mask)
         factor.groupby = groupby
@@ -162,6 +169,7 @@ class BaseFactor:
         return factor
 
     def to_weight(self, demean=True, mask: 'BaseFactor' = None):
+        """factor value to portfolio weight, which sum(abs(weight)) == 1"""
         factor = ToWeightFactor(inputs=(self,), mask=mask)
         factor.demean = demean
         return factor
@@ -173,6 +181,9 @@ class BaseFactor:
 
     def abs(self):
         return AbsFactor(inputs=(self,))
+
+    def log(self):
+        return LogFactor(inputs=(self,))
 
     def sum(self, win):
         return SumFactor(win, inputs=(self,))
@@ -199,11 +210,30 @@ class BaseFactor:
 
     fill_nan = fill_na
 
+    def masked_fill(self, mask, fill):
+        return MaskedFillFactor(inputs=(self, mask, fill))
+
     def any(self, win):
         return AnyFactor(win, inputs=(self,))
 
     def all(self, win):
         return AllFactor(win, inputs=(self,))
+
+    def clamp(self, left, right):
+        return ClampFactor(self, left, right)
+
+    def mad_clamp(self, z, mask: 'BaseFactor' = None):
+        factor = MADClampFactor(inputs=(self,))
+        factor.z = z
+        factor.set_mask(mask)
+        return factor
+
+    def float32(self):
+        factor = TypeCastFactor(inputs=(self,))
+        factor.dtype = torch.float32
+        return factor
+
+    float = float32
 
     # --------------- main methods ---------------
     @property
@@ -262,6 +292,7 @@ class CustomFactor(BaseFactor):
     _cache_stream = None
     _mask = None
     _force_delay = None
+    _keep_cache = False
 
     def __init__(self, win: Optional[int] = None, inputs: Optional[Sequence[BaseFactor]] = None):
         """
@@ -282,6 +313,15 @@ class CustomFactor(BaseFactor):
         assert isinstance(self.win, int), '`factor.win` must be a integer.'
 
         assert (self.win >= (self._min_win or 1))
+
+    @classmethod
+    def sequential(cls, *args):
+        """ Helper method for fast initialization """
+        if isinstance(args[0], int):
+            win = max(args[0], cls._min_win)
+            return cls(win, inputs=[*args[1:]])
+        else:
+            return cls(inputs=[*args[0:]])
 
     def set_mask(self, mask: BaseFactor = None):
         """ Mask fill all **INPUT** data to NaN """
@@ -320,8 +360,9 @@ class CustomFactor(BaseFactor):
 
     def clean_up_(self) -> None:
         super().clean_up_()
-        self._cache = None
-        self._cache_stream = None
+        if not self._keep_cache:
+            self._cache = None
+            self._cache_stream = None
         self._ref_count = 0
 
         if self.inputs:
@@ -337,8 +378,6 @@ class CustomFactor(BaseFactor):
         Called when engine run but before compute.
         """
         super().pre_compute_(engine, start, end)
-        self._cache = None
-        self._cache_stream = None
 
         self._ref_count += 1
         if self._ref_count > 1:  # already pre_compute_ed, skip child
@@ -350,6 +389,10 @@ class CustomFactor(BaseFactor):
 
         if self._mask is not None:
             self._mask.pre_compute_(engine, start, end)
+
+        if self._keep_cache:
+            # ref count +1 so this factor's cache will not cleanup
+            self._ref_count += 1
 
     def _format_input(self, upstream, upstream_out, mask_factor, mask_out):
         # If input.groupby not equal self.groupby, convert it
@@ -465,7 +508,7 @@ class CustomFactor(BaseFactor):
         raise NotImplementedError("abstractmethod")
 
 
-class TimeGroupFactor(CustomFactor, ABC):
+class CrossSectionFactor(CustomFactor, ABC):
     """Class that inputs and return value is grouped by datetime"""
     groupby = 'date'
     win = 1
@@ -474,7 +517,10 @@ class TimeGroupFactor(CustomFactor, ABC):
                  mask: Optional[BaseFactor] = None):
         super().__init__(win, inputs)
         self.set_mask(mask)
-        assert self.win == 1, 'TimeGroupFactor.win can only be 1'
+        assert self.win == 1, 'CrossSectionFactor.win can only be 1'
+
+    def __getitem__(self, key):
+        return MultiRetSelectorCS(inputs=(self, key))
 
 
 # --------------- helper factors ---------------
@@ -491,10 +537,19 @@ class MultiRetSelector(CustomFactor):
         return data[:, :, key]
 
 
+class MultiRetSelectorCS(MultiRetSelector, CrossSectionFactor):
+    pass
+
+
 class ShiftFactor(CustomFactor):
     periods = 1
 
     def compute(self, data: torch.Tensor) -> torch.Tensor:
+        if data.dtype in {torch.int8, torch.int16, torch.int32, torch.int64}:
+            raise ValueError('factor.shift() does not support `int` type, '
+                             'please convert to float by using `factor.float()`, upstreams: {}'
+                             .format(self.inputs))
+
         shift = data.roll(self.periods, dims=1)
         if self.periods > 0:
             shift[:, 0:self.periods] = np.nan
@@ -515,6 +570,11 @@ class SumFactor(CustomFactor):
         return data.nansum()
 
 
+class LogFactor(CustomFactor):
+    def compute(self, data: torch.Tensor) -> torch.Tensor:
+        return data.log()
+
+
 class AnyFactor(CustomFactor):
     _min_win = 2
 
@@ -529,6 +589,14 @@ class AllFactor(CustomFactor):
         return ~torch.isnan(data.values).all(dim=2)
 
 
+class TypeCastFactor(CustomFactor):
+    _min_win = 1
+    dtype = torch.float32
+
+    def compute(self, data: torch.Tensor) -> torch.Tensor:
+        return data.type(self.dtype)
+
+
 class PadFactor(CustomFactor):
     def compute(self, data: torch.Tensor) -> torch.Tensor:
         return pad_2d(data)
@@ -540,12 +608,21 @@ class FillNANFactor(CustomFactor):
         return data.masked_fill(mask, value)
 
 
+class MaskedFillFactor(CustomFactor):
+    def compute(self, data, mask, fill) -> torch.Tensor:
+        if isinstance(fill, (int, float, bool)):
+            return data.masked_fill(mask, fill)
+        ret = data.clone()
+        ret[mask] = fill[mask]
+        return ret
+
+
 class DoNothingFactor(CustomFactor):
     def compute(self, data: torch.Tensor) -> torch.Tensor:
         return data
 
 
-class RankFactor(TimeGroupFactor):
+class RankFactor(CrossSectionFactor):
     ascending = True,
 
     def compute(self, data: torch.Tensor) -> torch.Tensor:
@@ -561,7 +638,7 @@ class RankFactor(TimeGroupFactor):
         return rank
 
 
-class DemeanFactor(TimeGroupFactor):
+class DemeanFactor(CrossSectionFactor):
     group_dict = None
 
     def compute(self, data: torch.Tensor) -> torch.Tensor:
@@ -573,16 +650,20 @@ class DemeanFactor(TimeGroupFactor):
             ret = g.transform(lambda x: x - x.mean())
             return self._regroup(ret)
         else:
-            return data - nanmean(data)[:, None]
+            return data - nanmean(data).unsqueeze(-1)
 
 
-class ZScoreFactor(CustomFactor):
+class ZScoreFactor(CrossSectionFactor):
 
-    def compute(self, data: torch.Tensor) -> torch.Tensor:
-        return (data - nanmean(data)[:, None]) / nanstd(data)[:, None]
+    def compute(self, data: torch.Tensor, weight=None) -> torch.Tensor:
+        if weight is None:
+            mean = nanmean(data)
+        else:
+            mean = nansum(data * weight) / nansum(weight)
+        return (data - mean.unsqueeze(-1)) / nanstd(data).unsqueeze(-1)
 
 
-class QuantileClassifier(CustomFactor):
+class QuantileClassifier(CrossSectionFactor):
     """Returns the quantile of the factor at each datetime"""
     bins = 5
 
@@ -590,13 +671,44 @@ class QuantileClassifier(CustomFactor):
         return quantile(data, self.bins, dim=1)
 
 
-class ToWeightFactor(TimeGroupFactor):
+class ToWeightFactor(CrossSectionFactor):
     demean = True
 
     def compute(self, data: torch.Tensor) -> torch.Tensor:
         if self.demean:
-            data = data - nanmean(data)[:, None]
-        return data / nansum(data.abs(), dim=1)[:, None]
+            data = data - nanmean(data).unsqueeze(-1)
+        return data / nansum(data.abs(), dim=1).unsqueeze(-1)
+
+
+class ClampFactor(CustomFactor):
+    """ Simple Winsorizing """
+    _min_win = 1
+
+    def __init__(self, data, left, right):
+        super().__init__(win=1, inputs=[data, left, right])
+
+    def compute(self, data, left, right):
+        return data.clamp(left, right)
+
+
+class MADClampFactor(CustomFactor):
+    """ Mean Absolute Deviation Clamping """
+    z = 5
+
+    def compute(self, data):
+        median = data.median(dim=1).values.unsqueeze(-1)
+        mad = (data - median).abs().median(dim=1).values.unsqueeze(-1)
+        ret = data.clone()
+        upper = median + self.z * mad
+        lower = median - self.z * mad
+        upper_mask = data > upper
+        lower_mask = data < lower
+        upper = upper.repeat(1, data.shape[1])
+        lower = lower.repeat(1, data.shape[1])
+
+        ret[upper_mask] = upper[upper_mask]
+        ret[lower_mask] = lower[lower_mask]
+        return ret
 
 
 # --------------- op factors ---------------
